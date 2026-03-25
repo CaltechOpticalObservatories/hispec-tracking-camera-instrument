@@ -27,7 +27,7 @@ namespace Camera {
       void configure_instrument() override;
 
       std::vector<std::string> get_exposure_modes() override;
-      long set_exposure_mode(const std::string &modein) override;
+      long set_exposure_mode(const std::string &modein, const std::vector<std::string> &modeargs) override;
 
     private:
       // these are HISPEC Tracking Camera-specific functions

@@ -84,13 +84,13 @@ namespace Camera {
    * @return     ERROR|NO_ERROR
    *
    */
-  long HispecTrackingCamera::set_exposure_mode(const std::string &modein) {
+  long HispecTrackingCamera::set_exposure_mode(const std::string &modein, const std::vector<std::string> &modeargs) {
 
     if (modein==HispecTrackingCameraExposureMode::TRACKING) {
       this->exposuremode = std::make_unique<ExposureModeTracking>(this);
     }
     else {
-      return this->ArchonInterface::set_exposure_mode(modein);
+      return this->ArchonInterface::set_exposure_mode(modein, modeargs);
     }
 
     return NO_ERROR;
