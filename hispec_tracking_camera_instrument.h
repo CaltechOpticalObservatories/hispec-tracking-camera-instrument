@@ -53,8 +53,10 @@ namespace Camera {
       std::string tapline0_store;
 
       static constexpr int AUTOFETCH_HEADER_LEN = 36;
-      static constexpr int LVDS_MODULE = 10;
-      static constexpr int H2RG_MAX_PIXEL = 2047;
+
+      // Set in configure_instrument()
+      int lvds_module{0};
+      int h2rg_max_pixel{0};
   };
 
 }

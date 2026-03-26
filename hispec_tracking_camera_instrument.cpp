@@ -63,7 +63,12 @@ namespace Camera {
    */
   void HispecTrackingCamera::configure_instrument() {
     const std::string function("Camera::HispecTrackingCamera::configure_instrument");
-    logwrite(function, "");
+
+    this->lvds_module = 10;
+    this->h2rg_max_pixel = 2047;
+
+    logwrite(function, "LVDS module=" + std::to_string(this->lvds_module) +
+                       " H2RG max pixel=" + std::to_string(this->h2rg_max_pixel));
   }
   /***** Camera::HispecTrackingCamera::configure_instrument *******************/
 
@@ -367,7 +372,7 @@ namespace Camera {
     const std::string function("Camera::HispecTrackingCamera::h2rg_init");
 
     // Enable output to Pad B and HIGHOHM: 0100 000000010010 = 16402
-    long error = this->send_inreg_clocked(LVDS_MODULE, 1, 16402);
+    long error = this->send_inreg_clocked(this->lvds_module, 1, 16402);
     if (error != NO_ERROR) {
       logwrite(function, "ERROR enabling Pad B output and HIGHOHM");
       retstring = "error";
@@ -424,9 +429,9 @@ namespace Camera {
         return ERROR;
       }
 
-      if (vstart < 0 || vstop > H2RG_MAX_PIXEL || hstart < 0 || hstop > H2RG_MAX_PIXEL) {
+      if (vstart < 0 || vstop > this->h2rg_max_pixel || hstart < 0 || hstop > this->h2rg_max_pixel) {
         logwrite(function, "ERROR geometry values outside pixel range [0:" +
-                 std::to_string(H2RG_MAX_PIXEL) + "]");
+                 std::to_string(this->h2rg_max_pixel) + "]");
         return ERROR;
       }
 
@@ -437,19 +442,19 @@ namespace Camera {
 
       // Set detector registers for each ROI limit
       // vstart: base address 32768
-      error = this->send_inreg_clocked(LVDS_MODULE, 1, 32768 + vstart);
+      error = this->send_inreg_clocked(this->lvds_module, 1, 32768 + vstart);
       if (error == NO_ERROR) this->win_vstart = vstart;
 
       // vstop: base address 36864
-      if (error == NO_ERROR) error = this->send_inreg_clocked(LVDS_MODULE, 1, 36864 + vstop);
+      if (error == NO_ERROR) error = this->send_inreg_clocked(this->lvds_module, 1, 36864 + vstop);
       if (error == NO_ERROR) this->win_vstop = vstop;
 
       // hstart: base address 40960
-      if (error == NO_ERROR) error = this->send_inreg_clocked(LVDS_MODULE, 1, 40960 + hstart);
+      if (error == NO_ERROR) error = this->send_inreg_clocked(this->lvds_module, 1, 40960 + hstart);
       if (error == NO_ERROR) this->win_hstart = hstart;
 
       // hstop: base address 45056
-      if (error == NO_ERROR) error = this->send_inreg_clocked(LVDS_MODULE, 1, 45056 + hstop);
+      if (error == NO_ERROR) error = this->send_inreg_clocked(this->lvds_module, 1, 45056 + hstop);
       if (error == NO_ERROR) this->win_hstop = hstop;
 
       // If window mode is active, update geometries to match
@@ -532,7 +537,7 @@ namespace Camera {
         this->is_window = false;
 
         // Set detector out of window mode: 0111 000000001100 = 28684
-        error = this->send_inreg_clocked(LVDS_MODULE, 1, 28684);
+        error = this->send_inreg_clocked(this->lvds_module, 1, 28684);
 
         // Restore taplines
         if (error == NO_ERROR) {
@@ -567,7 +572,7 @@ namespace Camera {
         this->is_window = true;
 
         // Set detector into window mode: 0111 000000001111 = 28687
-        error = this->send_inreg_clocked(LVDS_MODULE, 1, 28687);
+        error = this->send_inreg_clocked(this->lvds_module, 1, 28687);
 
         // Save current tapline configuration before switching
         if (error == NO_ERROR) {
