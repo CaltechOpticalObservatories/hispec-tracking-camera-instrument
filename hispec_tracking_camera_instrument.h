@@ -8,6 +8,12 @@
 
 #include "archon_interface.h"
 #include "timing_stats.h"
+#include "frame_output.h"
+#include "shared_memory_writer.h"
+
+#include <memory>
+#include <string>
+#include <vector>
 
 namespace Camera {
 
@@ -57,6 +63,11 @@ namespace Camera {
       // Set in configure_instrument()
       int lvds_module{0};
       int h2rg_max_pixel{0};
+      std::string shm_segment_name{"hispec_tracking_camera"};
+      uint32_t shm_num_frames{4};
+
+      // Frame output destinations (shared memory, etc.)
+      std::vector<std::unique_ptr<Camera::FrameOutput>> frame_outputs;
   };
 
 }

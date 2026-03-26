@@ -69,6 +69,24 @@ namespace Camera {
 
     logwrite(function, "LVDS module=" + std::to_string(this->lvds_module) +
                        " H2RG max pixel=" + std::to_string(this->h2rg_max_pixel));
+
+    // Set up shared memory frame output.
+    // Max frame size uses full-frame H2RG dimensions as upper bound.
+    const size_t max_frame_bytes = static_cast<size_t>(
+      (this->h2rg_max_pixel + 1) * (this->h2rg_max_pixel + 1) * 4  // worst case: 32-bit full frame
+    );
+
+    auto shm_writer = std::make_unique<Camera::SharedMemoryWriter>(
+      this->shm_segment_name, max_frame_bytes, this->shm_num_frames);
+
+    if (shm_writer->open() == NO_ERROR) {
+      this->frame_outputs.push_back(std::move(shm_writer));
+      logwrite(function, "shared memory output enabled: segment=" + this->shm_segment_name +
+               " frames=" + std::to_string(this->shm_num_frames));
+    }
+    else {
+      logwrite(function, "WARNING: shared memory output failed to initialize");
+    }
   }
   /***** Camera::HispecTrackingCamera::configure_instrument *******************/
 
@@ -131,19 +149,46 @@ namespace Camera {
    */
   long HispecTrackingCamera::readout(const std::string &args, std::string &retstring) {
     const std::string function("Camera::HispecTrackingCamera::readout");
+    long error;
 
     if (this->is_autofetch_mode) {
-      long error = this->readout_autofetch();
-      retstring = (error == NO_ERROR) ? "done" : "error";
-      return error;
+      error = this->readout_autofetch();
+    }
+    else {
+      // Normal mode: use controller's standard FETCH-based read_frame
+      char* imagebuf = this->controller->framebuf;
+      error = this->controller->read_frame(ArchonController::FRAME_IMAGE, imagebuf);
+      if (error != NO_ERROR) {
+        logwrite(function, "ERROR reading frame from controller");
+      }
     }
 
-    // Normal mode: use controller's standard FETCH-based read_frame
-    char* imagebuf = this->controller->framebuf;
-    long error = this->controller->read_frame(ArchonController::FRAME_IMAGE, imagebuf);
-    if (error != NO_ERROR) {
-      logwrite(function, "ERROR reading frame from controller");
+    // Write to all configured frame outputs
+    if (error == NO_ERROR && !this->frame_outputs.empty()) {
+      auto* mode = &this->controller->modemap[this->controller->selectedmode];
+      const int num_detect = mode->geometry.num_detect;
+      const int bpp = (mode->samplemode == 1) ? 4 : 2;
+      const auto pixel_bytes = static_cast<size_t>(this->camera_info.image_memory * num_detect);
+
+      // In autofetch mode, pixel data starts after the 36-byte header
+      const char* pixel_data = this->is_autofetch_mode
+        ? this->controller->framebuf + AUTOFETCH_HEADER_LEN
+        : this->controller->framebuf;
+
+      const auto idx = this->controller->frameinfo.index.load();
+
+      Camera::FrameMetadata meta;
+      meta.frame_number = this->controller->frameinfo.bufframen[idx];
+      meta.timestamp = this->controller->frameinfo.buftimestamp[idx];
+      meta.width = mode->geometry.pixelcount;
+      meta.height = mode->geometry.linecount;
+      meta.bytes_per_pixel = bpp;
+
+      for (auto &output : this->frame_outputs) {
+        output->write(pixel_data, pixel_bytes, meta);
+      }
     }
+
     retstring = (error == NO_ERROR) ? "done" : "error";
     return error;
   }
