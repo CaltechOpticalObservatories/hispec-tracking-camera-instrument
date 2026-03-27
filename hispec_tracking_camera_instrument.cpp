@@ -70,6 +70,12 @@ namespace Camera {
     logwrite(function, "LVDS module=" + std::to_string(this->lvds_module) +
                        " H2RG max pixel=" + std::to_string(this->h2rg_max_pixel));
 
+    // Optimize Archon socket for high-speed streaming
+    constexpr int socket_buf_size = 1024 * 1024;  // 1 MB
+    this->controller->archon.set_tcp_nodelay(true);
+    this->controller->archon.set_recv_buf_size(socket_buf_size);
+    this->controller->archon.set_send_buf_size(socket_buf_size);
+
     // Set up shared memory frame output.
     // Max frame size uses full-frame H2RG dimensions as upper bound.
     const size_t max_frame_bytes = static_cast<size_t>(
