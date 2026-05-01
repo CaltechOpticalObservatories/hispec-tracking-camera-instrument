@@ -40,12 +40,24 @@ namespace Camera {
       return this->h2rg_init(args, retstring);
     }
     else
+    if ( cmd == "guiding_mode" ) {
+      return this->guiding_mode(args, retstring);
+    }
+    else
+    if ( cmd == "guiding_roi") {
+      return this->guiding_roi(args, retstring);
+    }
+    else
     if ( cmd == "window_mode" ) {
       return this->window_mode(args, retstring);
     }
     else
     if ( cmd == "window_roi" ) {
       return this->window_roi(args, retstring);
+    }
+    else
+    if ( cmd == "autofetch" ) {
+      return this->autofetch_mode(args, retstring);
     }
     else {
       retstring = "unrecognized command";
@@ -436,13 +448,70 @@ namespace Camera {
   }
   /***** Camera::HispecTrackingCamera::h2rg_init *****************************/
 
+  /***** Camera::HispecTrackingCamera::guiding_mode ****************************/
+  /**
+   * @brief      enables guiding mode
+   * @details    Sets register to enable subwindow/guide mode on the H2RG
+   *
+   * @param[in]  args       "vstart vstop hstart hstop" in pixels, or empty to query
+   * @param[out] retstring  current ROI as "vstart vstop hstart hstop"
+   * @return     ERROR|NO_ERROR
+   *
+   */
+  long HispecTrackingCamera::guiding_mode(const std::string &args, std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::guiding_mode");
+    long error = NO_ERROR;
 
-  /***** Camera::HispecTrackingCamera::window_roi ****************************/
+    if (!args.empty()) {
+      std::string state = args;
+      std::transform(state.begin(), state.end(), state.begin(), ::toupper);
+
+      if (state == "FALSE" || state == "0") {
+        // Switch back to DEFAULT mode — resets internal buffer geometries
+        if (error == NO_ERROR) error = this->set_camera_mode("DEFAULT");
+
+        //reset registers to diable guiding mode
+        if (error == NO_ERROR) error = this->send_inreg_clocked(this->lvds_module, 1, 28684);
+
+        if (error == NO_ERROR) logwrite(function, "guiding mode disabled");
+        this->is_guiding = false;
+      }
+      else if (state == "TRUE" || state == "1") {
+        // Switch to GUIDING camera mode
+        if (error == NO_ERROR) error = this->set_camera_mode("GUIDING");
+
+        //write to register to enable guiding mode
+        if (error == NO_ERROR) error = this->send_inreg_clocked(this->lvds_module, 1, 28687);
+
+        if (error == NO_ERROR) logwrite(function, "guiding mode enabled");
+        this->is_window = false;
+        this->is_default = false;
+        this->is_guiding = true;
+      }
+      else {
+        logwrite(function, "ERROR unrecognized argument: " + args);
+        retstring = "invalid_argument";
+        return ERROR;
+      }
+    }
+    else {
+      logwrite(function, "window mode query: " + std::string(this->is_guiding ? "enabled" : "disabled"));
+    }
+
+    retstring = this->is_guiding ? "true" : "false";
+    if (error != NO_ERROR) {
+      logwrite(function, "ERROR setting guiding mode");
+    }
+    return error;
+  }
+  }
+  /***** Camera::HispecTrackingCamera::guiding_mode ****************************/
+
+  /***** Camera::HispecTrackingCamera::guiding_roi ****************************/
   /**
    * @brief      set window region-of-interest geometry for the H2RG
    * @details    Sets the vstart, vstop, hstart, hstop pixel limits via INREG
-   *             commands. If window_mode is active, also updates CDS geometry,
-   *             Archon parameters, and camera_info to match.
+   *             commands.
    *
    *             H2RG INREG register addresses:
    *             vstart = 32768 (1000 000000000000)
@@ -455,8 +524,8 @@ namespace Camera {
    * @return     ERROR|NO_ERROR
    *
    */
-  long HispecTrackingCamera::window_roi(const std::string &args, std::string &retstring) {
-    const std::string function("Camera::HispecTrackingCamera::window_roi");
+  long HispecTrackingCamera::guiding_roi(const std::string &args, std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::guiding_roi");
     long error = NO_ERROR;
 
     if (!args.empty()) {
@@ -509,43 +578,63 @@ namespace Camera {
       if (error == NO_ERROR) this->win_hstop = hstop;
 
       // If window mode is active, update geometries to match
-      if (error == NO_ERROR && this->is_window) {
+      if (error == NO_ERROR && this->is_guiding) {
         const int rows = (this->win_vstop - this->win_vstart) + 1;
         const int cols = (this->win_hstop - this->win_hstart) + 1;
         std::string dummy;
 
         // Update Archon parameters
-        this->set_parameter("H2RG_win_columns " + std::to_string(cols), dummy);
-        this->set_parameter("H2RG_win_rows " + std::to_string(rows), dummy);
+        this->set_parameter("H2RG_columns " + std::to_string(cols), dummy);
+        this->set_parameter("H2RG_rows " + std::to_string(rows), dummy);
 
         // Update CDS geometry via config keys
+        std::string readout_mode = this->camera_info.current_observing_mode;
+        int pixelcount = cols;
+        if (readout_mode == "RXR") 
+        {
+            pixelcount = cols * 2;//Account for second pixel readout
+        }
+
         bool changed = false;
-        this->controller->write_config_key("PIXELCOUNT", cols, changed);
+        this->controller->write_config_key("PIXELCOUNT", pixelcount, changed);
         if (changed) this->controller->send_cmd(APPLYCDS);
         this->controller->write_config_key("LINECOUNT", rows, changed);
         if (changed) this->controller->send_cmd(APPLYCDS);
 
+        // Adjust geometry parameters and camera_info
+        //TODO:: revisit implemented version to also acomodate for rxr and utr mode.
+        pixelcount = cols *2;//*2 = reference amp columns
+        if (readout_mode == "RXR") 
+        {
+          pixelcount = cols * 4;//*4 = account for second pixel readout and reference amp columns
+        } 
         // Update modemap and camera_info
         auto &mode = this->controller->modemap[this->controller->selectedmode];
         mode.geometry.linecount = rows;
-        mode.geometry.pixelcount = cols;
+        mode.geometry.pixelcount = pixelcount;
         this->camera_info.region_of_interest = {
           static_cast<uint32_t>(this->win_hstart),
-          static_cast<uint32_t>(this->win_hstop),
+          static_cast<uint32_t>(this->win_hstart + (pixelcount - 1)),
           static_cast<uint32_t>(this->win_vstart),
           static_cast<uint32_t>(this->win_vstop)
         };
         this->camera_info.detector_pixels = {
-          static_cast<uint32_t>(cols),
+          static_cast<uint32_t>(pixelcount),// *2 = reference amp columns
           static_cast<uint32_t>(rows)
         };
-
         // H2RG is 16-bit
         this->camera_info.set_axes(16);
+        int num_detect = this->controller->modemap[readout_mode].geometry.num_detect;
+        this->image_data_bytes = (uint32_t) floor( ((this->camera_info.image_memory * num_detect) + BLOCK_LEN - 1 ) / BLOCK_LEN ) * BLOCK_LEN;
+
+        if (this->image_data_bytes == 0) {
+          this->camera.log_error( function, "image data size is zero! check NUM_DETECT, HORI_AMPS, VERT_AMPS in .acf file" );
+          error = ERROR;
+        }
       }
 
       if (error != NO_ERROR) {
-        logwrite(function, "ERROR setting window geometry");
+        logwrite(function, "ERROR setting guiding geometry");
         return ERROR;
       }
     }
@@ -556,20 +645,14 @@ namespace Camera {
                 std::to_string(this->win_hstop);
     return error;
   }
-  /***** Camera::HispecTrackingCamera::window_roi ****************************/
+  /***** Camera::HispecTrackingCamera::guiding_roi ****************************/
 
 
   /***** Camera::HispecTrackingCamera::window_mode ***************************/
   /**
    * @brief      toggle H2RG window/guiding mode on or off
    * @details    Entering window mode:
-   *             - Sets detector into window mode via INREG (28687 = 0111 000000001111)
-   *             - Saves current tapline config, switches to GUIDING camera mode
-   *             - Sets single tapline (AM33L,1,0) and updates CDS geometry
-   *             Leaving window mode:
-   *             - Sets detector out of window mode via INREG (28684 = 0111 000000001100)
-   *             - Restores taplines, switches back to DEFAULT camera mode
-   *             - Issues Abort parameter to complete the mode exit
+   *             - Calls mode "WINDOW" which sets acf mode for archon readout
    * @param[in]  args       "true"|"1" to enable, "false"|"0" to disable, empty to query
    * @param[out] retstring  current window state ("true" or "false")
    * @return     ERROR|NO_ERROR
@@ -578,115 +661,33 @@ namespace Camera {
   long HispecTrackingCamera::window_mode(const std::string &args, std::string &retstring) {
     const std::string function("Camera::HispecTrackingCamera::window_mode");
     long error = NO_ERROR;
-    std::string dummy;
 
     if (!args.empty()) {
       std::string state = args;
       std::transform(state.begin(), state.end(), state.begin(), ::toupper);
 
       if (state == "FALSE" || state == "0") {
-        this->is_window = false;
-
-        // Set detector out of window mode: 0111 000000001100 = 28684
-        error = this->send_inreg_clocked(this->lvds_module, 1, 28684);
-
-        // Restore taplines
-        if (error == NO_ERROR) {
-          bool changed = false;
-          this->controller->write_config_key("TAPLINES", this->taplines_store, changed);
-          if (changed) this->controller->send_cmd(APPLYCDS);
-          this->controller->write_config_key("TAPLINE0", this->tapline0_store.c_str(), changed);
-          if (changed) this->controller->send_cmd(APPLYCDS);
-        }
-
         // Switch back to DEFAULT mode — resets internal buffer geometries
         if (error == NO_ERROR) error = this->set_camera_mode("DEFAULT");
 
-        // Reset CDS to DEFAULT mode geometry
-        if (error == NO_ERROR) {
-          auto &mode = this->controller->modemap["DEFAULT"];
-          bool changed = false;
-          this->controller->write_config_key("PIXELCOUNT", mode.geometry.pixelcount, changed);
-          if (changed) this->controller->send_cmd(APPLYCDS);
-          this->controller->write_config_key("LINECOUNT", mode.geometry.linecount, changed);
-          if (changed) this->controller->send_cmd(APPLYCDS);
-        }
-
-        // Issue Abort to complete window mode exit
-        if (error == NO_ERROR) {
-          this->set_parameter("Abort 1", dummy);
-        }
-
         if (error == NO_ERROR) logwrite(function, "window mode disabled");
+        this->is_window = false;
       }
       else if (state == "TRUE" || state == "1") {
-        this->is_window = true;
-
-        // Set detector into window mode: 0111 000000001111 = 28687
-        error = this->send_inreg_clocked(this->lvds_module, 1, 28687);
-
-        // Save current tapline configuration before switching
-        if (error == NO_ERROR) {
-          this->controller->get_configmap_value("TAPLINES", this->taplines_store);
-
-          auto it = this->controller->configmap.find("TAPLINE0");
-          if (it != this->controller->configmap.end()) {
-            this->tapline0_store = it->second.value;
-          }
-        }
-
         // Switch to GUIDING camera mode
-        if (error == NO_ERROR) error = this->set_camera_mode("GUIDING");
-
-        // Set single tapline for window mode
-        if (error == NO_ERROR) {
-          bool changed = false;
-          this->controller->write_config_key("TAPLINES", 1, changed);
-          if (changed) this->controller->send_cmd(APPLYCDS);
-          this->controller->write_config_key("TAPLINE0", "AM33L,1,0", changed);
-          if (changed) this->controller->send_cmd(APPLYCDS);
-        }
-
-        // Set window dimensions from current ROI
-        if (error == NO_ERROR) {
-          const int rows = (this->win_vstop - this->win_vstart) + 1;
-          const int cols = (this->win_hstop - this->win_hstart) + 1;
-
-          this->set_parameter("H2RG_win_columns " + std::to_string(cols), dummy);
-          this->set_parameter("H2RG_win_rows " + std::to_string(rows), dummy);
-
-          // Update CDS geometry
-          bool changed = false;
-          this->controller->write_config_key("PIXELCOUNT", cols, changed);
-          if (changed) this->controller->send_cmd(APPLYCDS);
-          this->controller->write_config_key("LINECOUNT", rows, changed);
-          if (changed) this->controller->send_cmd(APPLYCDS);
-
-          // Update modemap and camera_info
-          auto &modeinfo = this->controller->modemap[this->controller->selectedmode];
-          modeinfo.geometry.linecount = rows;
-          modeinfo.geometry.pixelcount = cols;
-          this->camera_info.region_of_interest = {
-            static_cast<uint32_t>(this->win_hstart),
-            static_cast<uint32_t>(this->win_hstop),
-            static_cast<uint32_t>(this->win_vstart),
-            static_cast<uint32_t>(this->win_vstop)
-          };
-          this->camera_info.detector_pixels = {
-            static_cast<uint32_t>(cols),
-            static_cast<uint32_t>(rows)
-          };
-
-          this->camera_info.set_axes(16);
-        }
+        if (error == NO_ERROR) error = this->set_camera_mode("WINDOW");
 
         if (error == NO_ERROR) logwrite(function, "window mode enabled");
+        this->is_window = true;
       }
       else {
         logwrite(function, "ERROR unrecognized argument: " + args);
         retstring = "invalid_argument";
         return ERROR;
       }
+    }
+    else {
+      logwrite(function, "window mode query: " + std::string(this->is_window ? "enabled" : "disabled"));
     }
 
     retstring = this->is_window ? "true" : "false";
@@ -696,5 +697,156 @@ namespace Camera {
     return error;
   }
   /***** Camera::HispecTrackingCamera::window_mode ***************************/
+
+
+  /**************** Archon::Interface:: window_roi *********************************/
+  /**
+    * @fn     window_roi
+    * @brief  set window_roi limits for h2rg
+    * @param  geom_in  string, height and width of the roi in pixels
+    * @return ERROR or NO_ERROR
+    *
+    * NOTE:
+    */
+  long HispecTrackingCamera::window_roi(std::string geom_in, std::string &retstring) {
+    std::string function = "Camera::HispecTrackingCamera::window_mode";
+    std::stringstream message;
+    std::stringstream cmd;
+    std::string dontcare;
+    int height, width;
+    long error = NO_ERROR;
+    std::vector<std::string> tokens;
+
+    //Set Geometry of the roi here for later reference
+    if ( !geom_in.empty() ) {         // geometry arguments passed in
+      Tokenize(geom_in, tokens, " ");
+      if (tokens.size() != 2) {
+          message.str(""); message << "param expected 4 arguments (vstart, vstop, hstart, hstop) but got " << tokens.size();
+          this->camera.log_error( function, message.str() );
+          return ERROR;
+      }
+      try {
+          height = std::stoi( tokens[0] ); // test that inputs are integers
+          width = std::stoi( tokens[1] );
+
+      } catch (std::invalid_argument &) {
+          message.str(""); message << "unable to convert geometry values: " << geom_in << " to integer";
+          this->camera.log_error( function, message.str() );
+          return ERROR;
+
+      } catch (std::out_of_range &) {
+          message.str(""); message << "geometry values " << geom_in << " outside integer range";
+          this->camera.log_error( function, message.str() );
+          return ERROR;
+      }
+
+      // Validate values are within detector
+      if ( height < 0 || height > 2047 || width < 0 || width > 1024) {
+          message.str(""); message << "geometry values " << geom_in << " outside pixel range";
+          this->camera.log_error( function, message.str());
+          return ERROR;
+      }
+
+      //check and set window mode if not already active
+      if (!this->is_window) {
+        error = this->window_mode("true", dontcare);
+        if (error != NO_ERROR) {
+          message.str(""); message << "failed to set window mode for roi configuration";
+          this->camera.log_error( function, message.str() );
+          return ERROR;
+        }
+      }
+
+      // Set Parameters for ROI here
+      //H2RG_ rows, window_rows, columns, window_columns, rows_skip
+      int detector_rows = 2048;
+      int detector_cols = 1024;
+      this->win_vstart = (detector_rows/2) - (height/2); // set y lo lim
+      this->win_vstop = (detector_rows/2) + (height/2); // set y hi lim
+      this->win_hstart = (detector_cols/2) - (width/2); // set x lo lim
+      this->win_hstop = (detector_cols/2) + (width/2); // set roi x hi lim
+      int rows = height;
+      int cols = std::round((width + 1)/2);
+
+      if (error == NO_ERROR) {
+        error = this->set_parameter("H2RG_columns " + std::to_string(cols), dontcare); 
+      }
+      if (error == NO_ERROR) {
+        error = this->set_parameter("H2RG_rows " + std::to_string(rows), dontcare);
+      }
+      if (error == NO_ERROR) {
+        error = this->set_parameter("H2RG_rows+_skip " + std::to_string(this->win_vstart), dontcare);
+      }
+
+      // set cds values
+      // Update modemap and camera_info
+      auto &modeinfo = this->controller->modemap[this->controller->selectedmode];
+
+      std::string mode = this->camera_info.current_observing_mode;
+      
+      int pixelcount = cols;
+      if (mode == "RXR") {
+        pixelcount = cols * 2;
+      }
+      //Change CDS geometry to match new window geometry
+      cmd.str("");
+      this->controller->write_config_key("PIXELCOUNT", pixelcount, changed);
+      if (changed) this->controller->send_cmd(APPLYCDS);
+      this->controller->write_config_key("LINECOUNT", rows, changed);
+      if (changed) this->controller->send_cmd(APPLYCDS);
+
+      modeinfo.geometry.linecount = rows;
+      modeinfo.geometry.pixelcount = cols;
+      this->camera_info.detector_pixels = {
+        static_cast<uint32_t>(pixelcount * this->modemap[mode].geometry.amps[0]),
+        static_cast<uint32_t>(rows * this->modemap[mode].geometry.amps[1])
+      };
+      this->camera_info.region_of_interest = {
+        static_cast<uint32_t>(1),
+        static_cast<uint32_t>(this->camera_info.detector_pixels[0]),
+        static_cast<uint32_t>(1),
+        static_cast<uint32_t>(this->camera_info.detector_pixels[1])
+      };
+
+      this->camera_info.set_axes();
+      
+      //Resize Image data size based on new geometry
+      int num_detect = this->modemap[mode].geometry.num_detect;
+      this->image_data_bytes = (uint32_t) floor( ((this->camera_info.image_memory * num_detect) + BLOCK_LEN - 1 ) / BLOCK_LEN ) * BLOCK_LEN;
+
+      if (this->image_data_bytes == 0) {
+        this->camera.log_error( function, "image data size is zero! check NUM_DETECT, HORI_AMPS, VERT_AMPS in .acf file" );
+        error = ERROR;
+      }
+    } else {
+      //print region of interest and geometry info for current mode
+      std::string mode = this->camera_info.current_observing_mode;
+
+      std::ostringstream ss;
+
+      ss << "===== Camera Geometry Update =====\n"
+         << "Mode: " << mode << "\n"
+         << "Geometry -> "
+         << "Lines: " << this->modemap[mode].geometry.linecount
+         << ", Pixels: " << this->modemap[mode].geometry.pixelcount
+         << ", Num Detect: " << this->modemap[mode].geometry.num_detect << "\n"
+         << "Detector Pixels -> Cols: "
+         << this->camera_info.detector_pixels[0]
+         << ", Rows: "
+         << this->camera_info.detector_pixels[1] << "\n"
+         << "Image Memory: " << this->camera_info.image_memory << "\n"
+         << "Image Data Bytes (block aligned): " << this->image_data_bytes << "\n"
+         << "Tap Lines: " << TAPLINES << "\n"
+         << "Height: " << HEIGHT << "\n"
+         << "Width: " << WIDTH << "\n"
+         << "==================================\n";
+
+      std::string debug_string = ss.str();
+      logwrite( function, debug_string );
+      error = NO_ERROR;
+    }
+    return (error);
+  }
+  /**************** Archon::Interface:: window_roi *********************************/
 
 }
