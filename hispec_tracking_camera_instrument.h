@@ -38,12 +38,17 @@ namespace Camera {
 
       // H2RG detector commands
       long h2rg_init(const std::string &args, std::string &retstring);
+<<<<<<< HEAD
       long guiding_mode(const std::string &args, std::string &retstring);
       long guiding_roi(const std::string &args, std::string &retstring);
       long window_mode(const std::string &args, std::string &retstring);
       long window_roi(const std::string &args, std::string &retstring);
       long readout_mode(const std::string &args, std::string &retstring);
       long autofetch(const std::string &args, std::string &retstring);
+=======
+      long window_mode(const std::string &args, std::string &retstring);
+      long window_roi(const std::string &args, std::string &retstring);
+>>>>>>> main
 
       // Helper to send an INREG command and optionally clock it to the detector
       long send_inreg(int module, int inreg, int value);
@@ -54,9 +59,13 @@ namespace Camera {
       uint64_t prev_archon_ts{0};
 
       // Window mode state
+<<<<<<< HEAD
       bool is_window{false}; 
       bool is_guiding{false};
       bool is_default{false};
+=======
+      bool is_window{false};
+>>>>>>> main
       int win_vstart{0};
       int win_vstop{2047};
       int win_hstart{0};
