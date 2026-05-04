@@ -504,7 +504,6 @@ namespace Camera {
     }
     return error;
   }
-  }
   /***** Camera::HispecTrackingCamera::guiding_mode ****************************/
 
   /***** Camera::HispecTrackingCamera::guiding_roi ****************************/
@@ -521,7 +520,7 @@ namespace Camera {
    *
    * @param[in]  args       "vstart vstop hstart hstop" in pixels, or empty to query
    * @param[out] retstring  current ROI as "vstart vstop hstart hstop"
-   * @return     ERROR|NO_ERROR
+   * @return     ERROR|NO_ERRORHispecTrackingCamera
    *
    */
   long HispecTrackingCamera::guiding_roi(const std::string &args, std::string &retstring) {
@@ -588,7 +587,7 @@ namespace Camera {
         this->set_parameter("H2RG_rows " + std::to_string(rows), dummy);
 
         // Update CDS geometry via config keys
-        std::string readout_mode = this->camera_info.current_observing_mode;
+        std::string readout_mode = this->camera_info.modeselection;
         int pixelcount = cols;
         if (readout_mode == "RXR") 
         {
@@ -625,10 +624,10 @@ namespace Camera {
         // H2RG is 16-bit
         this->camera_info.set_axes(16);
         int num_detect = this->controller->modemap[readout_mode].geometry.num_detect;
-        this->image_data_bytes = (uint32_t) floor( ((this->camera_info.image_memory * num_detect) + BLOCK_LEN - 1 ) / BLOCK_LEN ) * BLOCK_LEN;
+        this->camera_info.image_data_bytes = (uint32_t) floor( ((this->camera_info.image_memory * num_detect) + BLOCK_LEN - 1 ) / BLOCK_LEN ) * BLOCK_LEN;
 
-        if (this->image_data_bytes == 0) {
-          this->camera.log_error( function, "image data size is zero! check NUM_DETECT, HORI_AMPS, VERT_AMPS in .acf file" );
+        if (this->camera_info.image_data_bytes == 0) {
+          logwrite( function, "image data size is zero! check NUM_DETECT, HORI_AMPS, VERT_AMPS in .acf file" );
           error = ERROR;
         }
       }
@@ -708,7 +707,7 @@ namespace Camera {
     *
     * NOTE:
     */
-  long HispecTrackingCamera::window_roi(std::string geom_in, std::string &retstring) {
+  long HispecTrackingCamera::window_roi(const std::string &geom_in, std::string &retstring) {
     std::string function = "Camera::HispecTrackingCamera::window_mode";
     std::stringstream message;
     std::stringstream cmd;
@@ -722,7 +721,7 @@ namespace Camera {
       Tokenize(geom_in, tokens, " ");
       if (tokens.size() != 2) {
           message.str(""); message << "param expected 4 arguments (vstart, vstop, hstart, hstop) but got " << tokens.size();
-          this->camera.log_error( function, message.str() );
+          logwrite( function, message.str() );
           return ERROR;
       }
       try {
@@ -731,19 +730,19 @@ namespace Camera {
 
       } catch (std::invalid_argument &) {
           message.str(""); message << "unable to convert geometry values: " << geom_in << " to integer";
-          this->camera.log_error( function, message.str() );
+          logwrite( function, message.str() );
           return ERROR;
 
       } catch (std::out_of_range &) {
           message.str(""); message << "geometry values " << geom_in << " outside integer range";
-          this->camera.log_error( function, message.str() );
+          logwrite( function, message.str() );
           return ERROR;
       }
 
       // Validate values are within detector
       if ( height < 0 || height > 2047 || width < 0 || width > 1024) {
           message.str(""); message << "geometry values " << geom_in << " outside pixel range";
-          this->camera.log_error( function, message.str());
+          logwrite( function, message.str());
           return ERROR;
       }
 
@@ -752,7 +751,7 @@ namespace Camera {
         error = this->window_mode("true", dontcare);
         if (error != NO_ERROR) {
           message.str(""); message << "failed to set window mode for roi configuration";
-          this->camera.log_error( function, message.str() );
+          logwrite( function, message.str() );
           return ERROR;
         }
       }
@@ -782,7 +781,7 @@ namespace Camera {
       // Update modemap and camera_info
       auto &modeinfo = this->controller->modemap[this->controller->selectedmode];
 
-      std::string mode = this->camera_info.current_observing_mode;
+      std::string mode = this->camera_info.modeselection;
       
       int pixelcount = cols;
       if (mode == "RXR") {
@@ -790,6 +789,7 @@ namespace Camera {
       }
       //Change CDS geometry to match new window geometry
       cmd.str("");
+      bool changed = false;
       this->controller->write_config_key("PIXELCOUNT", pixelcount, changed);
       if (changed) this->controller->send_cmd(APPLYCDS);
       this->controller->write_config_key("LINECOUNT", rows, changed);
@@ -798,8 +798,8 @@ namespace Camera {
       modeinfo.geometry.linecount = rows;
       modeinfo.geometry.pixelcount = cols;
       this->camera_info.detector_pixels = {
-        static_cast<uint32_t>(pixelcount * this->modemap[mode].geometry.amps[0]),
-        static_cast<uint32_t>(rows * this->modemap[mode].geometry.amps[1])
+        static_cast<uint32_t>(pixelcount * modeinfo.geometry.amps[0]),
+        static_cast<uint32_t>(rows * modeinfo.geometry.amps[1])
       };
       this->camera_info.region_of_interest = {
         static_cast<uint32_t>(1),
@@ -808,37 +808,43 @@ namespace Camera {
         static_cast<uint32_t>(this->camera_info.detector_pixels[1])
       };
 
-      this->camera_info.set_axes();
+      this->camera_info.set_axes(16);
       
       //Resize Image data size based on new geometry
-      int num_detect = this->modemap[mode].geometry.num_detect;
-      this->image_data_bytes = (uint32_t) floor( ((this->camera_info.image_memory * num_detect) + BLOCK_LEN - 1 ) / BLOCK_LEN ) * BLOCK_LEN;
+      int num_detect = modeinfo.geometry.num_detect;
+      this->camera_info.image_data_bytes = (uint32_t) floor( ((this->camera_info.image_memory * num_detect) + BLOCK_LEN - 1 ) / BLOCK_LEN ) * BLOCK_LEN;
 
-      if (this->image_data_bytes == 0) {
-        this->camera.log_error( function, "image data size is zero! check NUM_DETECT, HORI_AMPS, VERT_AMPS in .acf file" );
+      if (this->camera_info.image_data_bytes == 0) {
+        logwrite( function, "image data size is zero! check NUM_DETECT, HORI_AMPS, VERT_AMPS in .acf file" );
         error = ERROR;
       }
     } else {
       //print region of interest and geometry info for current mode
-      std::string mode = this->camera_info.current_observing_mode;
+      // Update modemap and camera_info
+      // 1. Get the current mode name (e.g., "DEFAULT")
+      std::string currentMode = this->controller->selectedmode; 
+      auto &modeinfo = this->controller->modemap[currentMode];
 
       std::ostringstream ss;
 
+      int height = this->camera_info.region_of_interest[2] - this->camera_info.region_of_interest[0];
+      int width = this->camera_info.region_of_interest[3] - this->camera_info.region_of_interest[1];
+
       ss << "===== Camera Geometry Update =====\n"
-         << "Mode: " << mode << "\n"
+         << "Mode: " << currentMode << "\n"
          << "Geometry -> "
-         << "Lines: " << this->modemap[mode].geometry.linecount
-         << ", Pixels: " << this->modemap[mode].geometry.pixelcount
-         << ", Num Detect: " << this->modemap[mode].geometry.num_detect << "\n"
+         << "Lines: " << modeinfo.geometry.linecount
+         << ", Pixels: " << modeinfo.geometry.pixelcount
+         << ", Num Detect: " << modeinfo.geometry.num_detect << "\n"
          << "Detector Pixels -> Cols: "
          << this->camera_info.detector_pixels[0]
          << ", Rows: "
          << this->camera_info.detector_pixels[1] << "\n"
          << "Image Memory: " << this->camera_info.image_memory << "\n"
-         << "Image Data Bytes (block aligned): " << this->image_data_bytes << "\n"
-         << "Tap Lines: " << TAPLINES << "\n"
-         << "Height: " << HEIGHT << "\n"
-         << "Width: " << WIDTH << "\n"
+         << "Image Data Bytes (block aligned): " << this->camera_info.image_data_bytes << "\n"
+         << "Tap Lines: " << modeinfo.tapinfo.num_taps << "\n"
+         << "Height: " <<  height << "\n"
+         << "Width: " << width   << "\n"
          << "==================================\n";
 
       std::string debug_string = ss.str();
@@ -848,5 +854,4 @@ namespace Camera {
     return (error);
   }
   /**************** Archon::Interface:: window_roi *********************************/
-
 }
