@@ -7,12 +7,10 @@
 #pragma once
 
 #include "archon_interface.h"
-#include "frame_output.h"
-#include "shared_memory_writer.h"
+#include "frame_output_factory.h"
+#include "hispec_tracking_camera_exposure_modes.h"
 
-#include <memory>
 #include <string>
-#include <vector>
 
 namespace Camera {
 
@@ -26,6 +24,10 @@ namespace Camera {
 
       std::vector<std::string> get_exposure_modes() override;
       long set_exposure_mode(const std::string &modein, const std::vector<std::string> &modeargs) override;
+
+      std::string default_exposure_mode_name() const override {
+        return std::string(HispecTrackingCameraExposureMode::FULLFRAME);
+      }
 
     private:
       // H2RG detector commands
@@ -49,11 +51,6 @@ namespace Camera {
       // Set in configure_instrument()
       int lvds_module{0};
       int h2rg_max_pixel{0};
-      std::string shm_segment_name{"hispec_tracking_camera"};
-      uint32_t shm_num_frames{4};
-
-      // Frame output destinations (shared memory, etc.)
-      std::vector<std::unique_ptr<Camera::FrameOutput>> frame_outputs;
   };
 
 }

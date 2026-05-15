@@ -65,23 +65,14 @@ namespace Camera {
     this->controller->archon.set_recv_buf_size(socket_buf_size);
     this->controller->archon.set_send_buf_size(socket_buf_size);
 
-    // Set up shared memory frame output.
-    // Max frame size uses full-frame H2RG dimensions as upper bound.
-    const size_t max_frame_bytes = static_cast<size_t>(
-      (this->h2rg_max_pixel + 1) * (this->h2rg_max_pixel + 1) * 4  // worst case: 32-bit full frame
-    );
+    Camera::FrameOutputsConfig fo_cfg;
+    fo_cfg.shm_enabled         = true;
+    fo_cfg.shm_segment_name    = "hispec_tracking_camera";
+    fo_cfg.shm_max_frame_bytes = static_cast<size_t>(
+        (this->h2rg_max_pixel + 1) * (this->h2rg_max_pixel + 1) * 4);
 
-    auto shm_writer = std::make_unique<Camera::SharedMemoryWriter>(
-      this->shm_segment_name, max_frame_bytes, this->shm_num_frames);
-
-    if (shm_writer->open() == NO_ERROR) {
-      this->frame_outputs.push_back(std::move(shm_writer));
-      logwrite(function, "shared memory output enabled: segment=" + this->shm_segment_name +
-               " frames=" + std::to_string(this->shm_num_frames));
-    }
-    else {
-      logwrite(function, "WARNING: shared memory output failed to initialize");
-    }
+    Camera::apply_config_overrides(fo_cfg, this->configfile);
+    this->frame_outputs = Camera::make_frame_outputs(fo_cfg);
   }
   /***** Camera::HispecTrackingCamera::configure_instrument *******************/
 
