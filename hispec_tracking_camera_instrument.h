@@ -7,7 +7,6 @@
 #pragma once
 
 #include "archon_interface.h"
-#include "timing_stats.h"
 #include "frame_output.h"
 #include "shared_memory_writer.h"
 
@@ -29,13 +28,6 @@ namespace Camera {
       long set_exposure_mode(const std::string &modein, const std::vector<std::string> &modeargs) override;
 
     private:
-      long readout(const std::string &args, std::string &retstring);
-      long expose(const std::string &args, std::string &retstring);
-
-      // Autofetch frame reading — reads a single frame from the Archon socket
-      // when autofetch mode is active. Returns frame data in the controller's framebuf.
-      long readout_autofetch();
-
       // H2RG detector commands
       long h2rg_init(const std::string &args, std::string &retstring);
       long window_mode(const std::string &args, std::string &retstring);
@@ -45,10 +37,6 @@ namespace Camera {
       long send_inreg(int module, int inreg, int value);
       long send_inreg_clocked(int module, int inreg, int value);
 
-      Utils::TimingStats fetch_stats;
-      Utils::TimingStats archon_ts_deltas;
-      uint64_t prev_archon_ts{0};
-
       // Window mode state
       bool is_window{false};
       int win_vstart{0};
@@ -57,8 +45,6 @@ namespace Camera {
       int win_hstop{2047};
       int taplines_store{0};
       std::string tapline0_store;
-
-      static constexpr int AUTOFETCH_HEADER_LEN = 36;
 
       // Set in configure_instrument()
       int lvds_module{0};

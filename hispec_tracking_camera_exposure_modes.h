@@ -18,20 +18,20 @@ namespace Camera {
    * @namespace  all recognized exposure modes for HispecTrackingCamera
    */
   namespace HispecTrackingCameraExposureMode {
-    constexpr const char* TRACKING = "TRACKING";
-    constexpr const char* ALLMODES[] = {TRACKING};
+    constexpr const char* FULLFRAME = "FULLFRAME";
+    constexpr const char* ALLMODES[] = {FULLFRAME};
   }
 
   class HispecTrackingCamera;
 
-  class ExposureModeTracking : public ExposureModeTemplate<Camera::ArchonInterface> {
+  class ExposureModeFullFrame : public ExposureModeTemplate<Camera::ArchonInterface> {
     public:
-      ExposureModeTracking(Camera::ArchonInterface* iface)
+      ExposureModeFullFrame(Camera::ArchonInterface* iface)
         : ExposureModeTemplate<Camera::ArchonInterface>(iface) {
-          type=HispecTrackingCameraExposureMode::TRACKING;
+          type=HispecTrackingCameraExposureMode::FULLFRAME;
         }
 
-    long expose() override;
+    void image_acquisition_thread() override;
   };
 
 }
