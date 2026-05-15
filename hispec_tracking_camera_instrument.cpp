@@ -10,36 +10,36 @@
 
 namespace Camera {
 
+  const std::unordered_map<std::string, HispecTrackingCamera::CmdHandler>
+  HispecTrackingCamera::command_handlers_ = {
+    {"h2rg_init",   &HispecTrackingCamera::h2rg_init},
+    {"window_mode", &HispecTrackingCamera::window_mode},
+    {"window_roi",  &HispecTrackingCamera::window_roi},
+  };
+
+  /***** Camera::HispecTrackingCamera::is_instrument_command ******************/
+  /**
+   * @brief  true if cmd names an instrument-specific handler
+   */
+  bool HispecTrackingCamera::is_instrument_command(const std::string &cmd) {
+    return command_handlers_.find(cmd) != command_handlers_.end();
+  }
+  /***** Camera::HispecTrackingCamera::is_instrument_command ******************/
+
+
   /***** Camera::HispecTrackingCamera::instrument_cmd *************************/
   /**
-   * @brief      dispatcher for HISPEC Tracking Camera-specific instrument commands
-   * @details    This allows dispatching instrument specific commands by receiving
-   *             the command and args and calling the appropriate instrument
-   *             specific function.
-   * @param[in]  cmd        command
-   * @param[in]  args       any number of arguments
-   * @param[out] retstring  return string
-   * @return     ERROR|NO_ERROR|HELP
-   *
+   * @brief  dispatch an instrument-specific command
    */
   long HispecTrackingCamera::instrument_cmd(const std::string &cmd,
-                              const std::string &args,
-			      std::string &retstring) {
-    if ( cmd == "h2rg_init" ) {
-      return this->h2rg_init(args, retstring);
-    }
-    else
-    if ( cmd == "window_mode" ) {
-      return this->window_mode(args, retstring);
-    }
-    else
-    if ( cmd == "window_roi" ) {
-      return this->window_roi(args, retstring);
-    }
-    else {
+                                            const std::string &args,
+                                            std::string &retstring) {
+    auto it = command_handlers_.find(cmd);
+    if (it == command_handlers_.end()) {
       retstring = "unrecognized command";
       return ERROR;
     }
+    return (this->*(it->second))(args, retstring);
   }
   /***** Camera::HispecTrackingCamera::instrument_cmd *************************/
 

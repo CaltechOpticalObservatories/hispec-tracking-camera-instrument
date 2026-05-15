@@ -11,6 +11,7 @@
 #include "hispec_tracking_camera_exposure_modes.h"
 
 #include <string>
+#include <unordered_map>
 
 namespace Camera {
 
@@ -19,6 +20,8 @@ namespace Camera {
       long instrument_cmd(const std::string &cmd,
                           const std::string &args,
                           std::string &retstring) override;
+
+      bool is_instrument_command(const std::string &cmd) override;
 
       void configure_instrument() override;
 
@@ -30,6 +33,9 @@ namespace Camera {
       }
 
     private:
+      using CmdHandler = long (HispecTrackingCamera::*)(const std::string&, std::string&);
+      static const std::unordered_map<std::string, CmdHandler> command_handlers_;
+
       // H2RG detector commands
       long h2rg_init(const std::string &args, std::string &retstring);
       long window_mode(const std::string &args, std::string &retstring);

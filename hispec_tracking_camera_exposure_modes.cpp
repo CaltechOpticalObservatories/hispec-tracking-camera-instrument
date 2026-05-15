@@ -179,11 +179,11 @@ namespace Camera {
       ++frames_read;
     }
 
+    if (!archon_ts_deltas.empty()) {
+      logwrite(function, archon_ts_deltas.summary("archon frame interval"));
+    }
     if (!fetch_stats.empty()) {
-      logwrite(function, fetch_stats.summary());
-      if (!archon_ts_deltas.empty()) {
-        logwrite(function, "archon timestamps: " + archon_ts_deltas.summary());
-      }
+      logwrite(function, fetch_stats.summary("host readout duration"));
     }
     logwrite(function, "sequence complete: " + std::to_string(frames_read) +
              " of " + std::to_string(nseq) + " frames");
