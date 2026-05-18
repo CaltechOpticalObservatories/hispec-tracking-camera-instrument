@@ -42,7 +42,17 @@ namespace Camera {
 
     char* buf = controller->framebuf;
     size_t total_read = 0;
+    const auto timeout = std::chrono::seconds(10);
+
     while (total_read < frame_size) {
+      if (hispec->is_aborted()) {
+        logwrite(function, "aborted while reading autofetch frame");
+        return ERROR;
+      }
+      if (std::chrono::steady_clock::now() - fetch_start > timeout) {
+        logwrite(function, "ERROR overall timeout reading autofetch frame");
+        return ERROR;
+      }
       if (!controller->archon.is_readable(1000)) {
         logwrite(function, "ERROR timeout waiting for autofetch data");
         return ERROR;
