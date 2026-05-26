@@ -153,6 +153,67 @@ namespace Camera {
   }
   /***** Camera::HispecTrackingCamera::set_exposure_mode **********************/
 
+  /***** Camera::HispecTrackingCamera::reset_exposure_modes **********************/
+  /**
+   * @brief      zeros out mode parameters in preperation for mode setting
+   * @return     ERROR|NO_ERROR
+   *
+   */
+  long HispecTrackingCamera::reset_exposure_mode() {
+    long error = NO_ERROR;
+    //Reset all exposure params to zero and return error
+    for (const auto& name : this->exposure_modes) {
+      error = this->controller->prep_parameter(name, 0);
+      if (error == NO_ERROR) {
+        error = this->controller->load_parameter(name, 0);
+      }
+      if (error == ERROR) return error;
+    }
+    return error;
+  }
+  /***** Camera::HispecTrackingCamera::reset_exposure_mode **********************/
+
+  /***** Camera::HispecTrackingCamera::apply_exposure_modes **********************/
+  /**
+   * @brief      grabs exposure mode parameter to set mode
+   * @return     ERROR|NO_ERROR
+   *
+   */
+  long HispecTrackingCamera::apply_exposure_mode(const std::string& mode) {
+    long error = NO_ERROR;
+    //find and apply mode, set param or return error
+    std::string lower_mode = mode;
+    std::transform(lower_mode.begin(), lower_mode.end(), lower_mode.begin(),
+        [](unsigned char c) { return std::tolower(c); });
+
+    auto valid_mode = std::find(exposure_modes.begin(), exposure_modes.end(), lower_mode);
+    if (valid_mode == exposure_modes.end()) {
+        return ERROR;
+    }
+
+    error = this->controller->prep_parameter(lower_mode, 1);
+    if (error == NO_ERROR) {
+      error = this->controller->load_parameter(lower_mode, 1);
+    }
+    if (error == ERROR) return error;
+    return error;
+  }
+  /***** Camera::HispecTrackingCamera::apply_exposure_mode **********************/
+
+  /***** Camera::HispecTrackingCamera::roi ********************************/
+  /**
+   * @brief      sets roi depending on camera configuration and readout mode
+   * @details    Handles:
+   *             - ROI math
+   *             - Parameter setting
+   *             - gemoetry
+   * @param[in]  args       region of interest
+   * @param[out] retstring  return string
+   * @return     ERROR|NO_ERROR
+   *
+   */
+
+  /***** Camera::HispecTrackingCamera::roi ********************************/
 
   /***** Camera::HispecTrackingCamera::readout ********************************/
   /**
