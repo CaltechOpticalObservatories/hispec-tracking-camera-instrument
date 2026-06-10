@@ -7,13 +7,11 @@
 #pragma once
 
 #include "archon_interface.h"
-#include "timing_stats.h"
-#include "frame_output.h"
-#include "shared_memory_writer.h"
+#include "frame_output_factory.h"
+#include "hispec_tracking_camera_exposure_modes.h"
 
-#include <memory>
 #include <string>
-#include <vector>
+#include <unordered_map>
 
 namespace Camera {
 
@@ -23,18 +21,20 @@ namespace Camera {
                           const std::string &args,
                           std::string &retstring) override;
 
+      bool is_instrument_command(const std::string &cmd) override;
+
       void configure_instrument() override;
 
       std::vector<std::string> get_exposure_modes() override;
       long set_exposure_mode(const std::string &modein, const std::vector<std::string> &modeargs) override;
 
-    private:
-      long readout(const std::string &args, std::string &retstring);
-      long expose(const std::string &args, std::string &retstring);
+      std::string default_exposure_mode_name() const override {
+        return std::string(HispecTrackingCameraExposureMode::FULLFRAME);
+      }
 
-      // Autofetch frame reading — reads a single frame from the Archon socket
-      // when autofetch mode is active. Returns frame data in the controller's framebuf.
-      long readout_autofetch();
+    private:
+      using CmdHandler = long (HispecTrackingCamera::*)(const std::string&, std::string&);
+      static const std::unordered_map<std::string, CmdHandler> command_handlers_;
 
       // H2RG detector commands
       long h2rg_init(const std::string &args, std::string &retstring);
@@ -45,10 +45,6 @@ namespace Camera {
       long send_inreg(int module, int inreg, int value);
       long send_inreg_clocked(int module, int inreg, int value);
 
-      Utils::TimingStats fetch_stats;
-      Utils::TimingStats archon_ts_deltas;
-      uint64_t prev_archon_ts{0};
-
       // Window mode state
       bool is_window{false};
       int win_vstart{0};
@@ -58,16 +54,9 @@ namespace Camera {
       int taplines_store{0};
       std::string tapline0_store;
 
-      static constexpr int AUTOFETCH_HEADER_LEN = 36;
-
       // Set in configure_instrument()
       int lvds_module{0};
       int h2rg_max_pixel{0};
-      std::string shm_segment_name{"hispec_tracking_camera"};
-      uint32_t shm_num_frames{4};
-
-      // Frame output destinations (shared memory, etc.)
-      std::vector<std::unique_ptr<Camera::FrameOutput>> frame_outputs;
   };
 
 }
