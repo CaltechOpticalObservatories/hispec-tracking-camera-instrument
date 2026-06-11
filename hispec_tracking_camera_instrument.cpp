@@ -14,7 +14,7 @@ namespace Camera {
   HispecTrackingCamera::command_handlers_ = {
     {"h2rg_init",   &HispecTrackingCamera::h2rg_init},
     {"window_mode", &HispecTrackingCamera::window_mode},
-    {"window_roi",  &HispecTrackingCamera::window_roi},
+    {"guiding_roi",  &HispecTrackingCamera::guiding_roi},
   };
 
   /***** Camera::HispecTrackingCamera::is_instrument_command ******************/
@@ -188,8 +188,129 @@ namespace Camera {
   }
   /***** Camera::HispecTrackingCamera::h2rg_init *****************************/
 
+  /***** Camera::HispecTrackingCamera::roi ******************************/
+  /**
+   * @brief      
+   * @details    This roi method takes in arguments for the region of interest.
+   *                - Checks mode (POSSIBLY SPLIT INTO SEPARATE FUNCTIONS)
+   *                - if args = 4
+   *                  - vstart, vstop, hstart, hstop
+   *                - if args = 2
+   *                  - hight and width from center point
+   *                - if args = 0
+   *                  - query current ROI
+   * @param[in]  
+   * @param[out] 
+   * @return     
+   *
+   */
+  long HispecTrackingCamera::roi(const std::string &args, std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::guiding_roi");
+    long error = NO_ERROR;
+    std::string upper_args = args;
+    std::transform( upper_args.begin(), upper_args.end(), upper_args.begin(), ::toupper );  // make uppercase
 
-  /***** Camera::HispecTrackingCamera::window_roi ****************************/
+    // Handle different argument counts
+    if (args.size() == 4) {
+      return this->guiding_roi(args, retstring);
+    } else if (args.size() == 2) {
+      return this->roi_exec(args, retstring);
+    } else if (args.size() == 1 && upper_args == "FULLFRAME") {
+      return this->fullframe(args, retstring);
+    } else {
+      //query current ROI
+      retstring = "Current ROI: " + std::to_string(this->win_hstart) + ", " + std::to_string(this->win_vstart) + ", " + std::to_string(this->win_hstop) + ", " + std::to_string(this->win_vstop);
+      retstring += "\nProvide arguments to execute ROI command.";
+      return NO_ERROR;
+    }
+    return error;
+  }
+  /***** Camera::HispecTrackingCamera::roi ******************************/
+
+  /***** Camera::HispecTrackingCamera::roi_exec ******************************/
+  /**
+   * @brief      sets a centered reagion of interest with  taplines > 2
+   * @details    This roi method takes in arguments for the region of interest.
+   *                - Validates the arguments
+   *                - Sets the parameters from the acf file
+   *                - Sets the CDS variables
+   *                - Sets the geometry
+   *                - Resizes the image buffer
+   * @param[in]  args       2 arguments (height width)
+   * @param[out] 
+   * @return     
+   *
+   */
+  long HispecTrackingCamera::roi_exec(const std::string &args, std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::roi_exec");
+    std::stringstream cmd;
+    std::stringstream message;
+    std::string dummy;
+    long error = NO_ERROR;
+    int height, width, vstart, vstop, hstart, hstop;
+
+    //validate the arguments
+    if (this->validate_roi(args, retstring) != NO_ERROR) { return ERROR; }
+
+    //Tokenize the arguments
+    std::vector<std::string> tokens;
+    Tokenize(args, tokens, " ");
+    height = std::stoi(tokens[0]);
+    width = std::stoi(tokens[1]);
+
+    //center the ROI
+    vstart = (2048 - height) / 2;
+    vstop = vstart + height - 1;
+    hstart = (1024 - width) / 2;
+    hstop = hstart + width - 1;
+    // Set Parameters for ROI here
+      //H2RG_ rows, window_rows, columns, window_columns, rows_skip
+    this->win_vstart = vstart; // set y lo lim
+    this->win_vstop = vstop; // set y hi lim
+    this->win_hstart = hstart; // set x lo lim
+    this->win_hstop = hstop; // set roi x hi lim
+    int rows = (this->win_vstop - this->win_vstart) + 1;
+    int cols = std::round(((this->win_hstop - this->win_hstart) + 1)/2);
+    cmd.str("");
+    // Update Archon parameters
+    this->set_parameter("H2RG_columns " + std::to_string(cols), dummy);
+    this->set_parameter("H2RG_rows " + std::to_string(rows), dummy);
+    this->set_parameter("H2RG_rows_skip " + std::to_string(vstart), dummy);
+
+    //Check mode and set cds variables
+    // Update CDS geometry via config keys
+    bool changed = false;
+    int pixelcount = cols;
+    // TODO:: MODE needs to indicate what the exposure or readout type is
+    auto &mode = this->controller->modemap[this->controller->selectedmode];
+    //if (mode.samplemode == "RXR") {
+    //  pixelcount = cols * 2;
+    //}
+    this->controller->write_config_key("PIXELCOUNT", pixelcount, changed);
+    if (changed) this->controller->send_cmd(APPLYCDS);
+    this->controller->write_config_key("LINECOUNT", rows, changed);
+    if (changed) this->controller->send_cmd(APPLYCDS);
+
+    //set geometry
+    mode.geometry.linecount = rows;
+    mode.geometry.pixelcount = pixelcount;
+    this->camera_info.region_of_interest = {
+      static_cast<uint32_t>(this->win_hstart),
+      static_cast<uint32_t>(this->win_hstop),
+      static_cast<uint32_t>(this->win_vstart),
+      static_cast<uint32_t>(this->win_vstop)
+    };
+    this->camera_info.detector_pixels = {
+      static_cast<uint32_t>(pixelcount),
+      static_cast<uint32_t>(rows)
+    };
+    //resize the image buffer TODO::
+    //this->resize_image_buffer(pixelcount, rows);    
+    return error;
+  }
+  /***** Camera::HispecTrackingCamera::roi_exec ******************************/
+
+  /***** Camera::HispecTrackingCamera::guiding_roi ****************************/
   /**
    * @brief      set window region-of-interest geometry for the H2RG
    * @details    Sets the vstart, vstop, hstart, hstop pixel limits via INREG
@@ -207,19 +328,15 @@ namespace Camera {
    * @return     ERROR|NO_ERROR
    *
    */
-  long HispecTrackingCamera::window_roi(const std::string &args, std::string &retstring) {
-    const std::string function("Camera::HispecTrackingCamera::window_roi");
+  long HispecTrackingCamera::guiding_roi(const std::string &args, std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::guiding_roi");
     long error = NO_ERROR;
 
     if (!args.empty()) {
       std::vector<std::string> tokens;
       Tokenize(args, tokens, " ");
 
-      if (tokens.size() != 4) {
-        logwrite(function, "ERROR expected 4 arguments (vstart vstop hstart hstop) but got " +
-                 std::to_string(tokens.size()));
-        return ERROR;
-      }
+      if (this->validate_roi(args, retstring) != NO_ERROR) {return ERROR;}
 
       int vstart, vstop, hstart, hstop;
       try {
@@ -229,17 +346,6 @@ namespace Camera {
         hstop  = std::stoi(tokens[3]);
       } catch (const std::exception &e) {
         logwrite(function, "ERROR unable to convert geometry values: " + args);
-        return ERROR;
-      }
-
-      if (vstart < 0 || vstop > this->h2rg_max_pixel || hstart < 0 || hstop > this->h2rg_max_pixel) {
-        logwrite(function, "ERROR geometry values outside pixel range [0:" +
-                 std::to_string(this->h2rg_max_pixel) + "]");
-        return ERROR;
-      }
-
-      if (vstart >= vstop || hstart >= hstop) {
-        logwrite(function, "ERROR geometry values not correctly ordered");
         return ERROR;
       }
 
@@ -267,18 +373,24 @@ namespace Camera {
         std::string dummy;
 
         // Update Archon parameters
-        this->set_parameter("H2RG_win_columns " + std::to_string(cols), dummy);
-        this->set_parameter("H2RG_win_rows " + std::to_string(rows), dummy);
+        this->set_parameter("H2RG_columns " + std::to_string(cols), dummy);
+        this->set_parameter("H2RG_rows " + std::to_string(rows), dummy);
+        this->set_parameter("H2RG_rows_skip 0", dummy);
 
         // Update CDS geometry via config keys
         bool changed = false;
+        int pixelcount = cols;
+        auto &mode = this->controller->modemap[this->controller->selectedmode];
+        //TODO: make sure rxr is identifiable
+        //if (mode == "RXR") {
+        // pixelcount = cols*2;
+        //}
         this->controller->write_config_key("PIXELCOUNT", cols, changed);
         if (changed) this->controller->send_cmd(APPLYCDS);
         this->controller->write_config_key("LINECOUNT", rows, changed);
         if (changed) this->controller->send_cmd(APPLYCDS);
 
         // Update modemap and camera_info
-        auto &mode = this->controller->modemap[this->controller->selectedmode];
         mode.geometry.linecount = rows;
         mode.geometry.pixelcount = cols;
         this->camera_info.region_of_interest = {
@@ -288,7 +400,7 @@ namespace Camera {
           static_cast<uint32_t>(this->win_vstop)
         };
         this->camera_info.detector_pixels = {
-          static_cast<uint32_t>(cols),
+          static_cast<uint32_t>(pixelcount * this->taplines_store),
           static_cast<uint32_t>(rows)
         };
 
@@ -308,8 +420,142 @@ namespace Camera {
                 std::to_string(this->win_hstop);
     return error;
   }
-  /***** Camera::HispecTrackingCamera::window_roi ****************************/
+  /***** Camera::HispecTrackingCamera::guiding_roi ****************************/
 
+  /**** Camera::HispecTrackingCamera::fullframe ******************************/
+  /**
+   * @brief      executes the fullframe command
+   * @details    This function resets the ROI to fullframe and taplines.
+   * @param[in]  args       arguments for the command
+   * @param[out] retstring  error message if execution fails
+   * @return     ERROR|NO_ERROR
+   *
+   */
+  long HispecTrackingCamera::fullframe(const std::string &args, std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::fullframe");
+    std::string dummy;
+    std::string cmd;
+    long error = NO_ERROR;
+    std::stringstream message;
+    int cols = 512;
+    int rows = 2048;
+    int vstart = 0;
+
+    //SET CAMERAMODE TO FULLFRAME
+    
+    //set cds and params back to fullframe default
+    // Update Archon parameters
+    this->set_parameter("H2RG_columns " + std::to_string(cols), dummy);
+    this->set_parameter("H2RG_rows " + std::to_string(rows), dummy);
+    this->set_parameter("H2RG_rows_skip " + std::to_string(vstart), dummy);
+
+    //Check mode and set cds variables
+    // Update CDS geometry via config keys
+    bool changed = false;
+    int pixelcount = cols;
+    auto &mode = this->controller->modemap[this->controller->selectedmode];
+    this->controller->write_config_key("PIXELCOUNT", pixelcount, changed);
+    if (changed) this->controller->send_cmd(APPLYCDS);
+    this->controller->write_config_key("LINECOUNT", rows, changed);
+    if (changed) this->controller->send_cmd(APPLYCDS);
+
+    // Reset the ROI to fullframe and taplines
+    this->win_hstart = 0;
+    this->win_hstop = 2047;
+    this->win_vstart = 0;
+    this->win_vstop = 2047;
+    this->camera_info.region_of_interest = {
+      static_cast<uint32_t>(this->win_hstart),
+      static_cast<uint32_t>(this->win_hstop),
+      static_cast<uint32_t>(this->win_vstart),
+      static_cast<uint32_t>(this->win_vstop)
+    };
+    //set detector.pixels = taplines * pixelcount
+    this->camera_info.detector_pixels = {
+      static_cast<uint32_t>(this->taplines_store * pixelcount),
+      static_cast<uint32_t>(rows)
+    };
+
+    return error;
+  }
+  /**** Camera::HispecTrackingCamera::fullframe ******************************/
+
+  /**** Camera::HispecTrackingCamera::validate_roi ******************************/
+  /**
+   * @brief      validates the ROI arguments
+   * @details    This function checks if the ROI arguments are valid.
+   * @param[in]  args       4 arguments (vstart vstop hstart hstop) in pixels
+   * @param[out] retstring  error message if validation fails
+   * @return     ERROR|NO_ERROR
+   *
+   */
+  long HispecTrackingCamera::validate_roi(const std::string &args, std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::validate_roi");
+    long error = NO_ERROR;
+    std::stringstream message;
+    std::vector<std::string> tokens;
+    int vstart, vstop, hstart, hstop, height, width;
+    Tokenize(args, tokens, " ");
+    if (tokens.size() != 4 && tokens.size() != 2) {
+        message.str(""); message << "param expected 4 or 2 arguments (vstart, vstop, hstart, hstop) || (Height and Width) but got " << tokens.size();
+        retstring = message.str();
+        logwrite(function, message.str() );
+        return ERROR;
+    }
+    if (tokens.size() == 2) {
+      // Check if the two arguments are valid height and width
+      try {
+          height = std::stoi(tokens[0]);
+          width = std::stoi(tokens[1]);
+          if (height <= 0 || width <= 0) {
+              message.str(""); message << "Height and width must be positive integers";
+              retstring = message.str();
+              logwrite(function, message.str());
+              return ERROR;
+          } else if (height > 2048 || width > 1024) {
+              message.str(""); message << "Height and width must be within the detector range";
+              retstring = message.str();
+              logwrite(function, message.str());
+              return ERROR;
+          }
+      } catch (std::invalid_argument &) {
+          message.str(""); message << "Height and width must be valid integers";
+          retstring = message.str();
+          logwrite(function, message.str());
+          return ERROR;
+      }
+    } else {
+      // Check if the four arguments are valid vstart, vstop, hstart, hstop
+      try {
+          vstart = std::stoi(tokens[0]);
+          vstop = std::stoi(tokens[1]);
+          hstart = std::stoi(tokens[2]);
+          hstop = std::stoi(tokens[3]);
+      } catch (std::invalid_argument &) {
+          message.str(""); message << "vstart, vstop, hstart, hstop must be valid integers";
+          retstring = message.str();
+          logwrite(function, message.str());
+          return ERROR;
+      }
+      // Validate values are within detector
+      if ( vstart < 0 || vstop > 2047 || hstart < 0 || hstop > 2047) {
+          message.str(""); message << "geometry values " << args << " outside pixel range";
+          retstring = message.str();
+          logwrite( function, message.str());
+          return ERROR;
+      }
+      // Validate values have proper ordering
+      if (vstart >= vstop || hstart >= hstop) {
+          message.str(""); message << "geometry values " << args << " are not correctly ordered";
+          retstring = message.str();
+          logwrite( function, message.str());
+          return ERROR;
+      }
+    }
+    retstring = message.str();
+    return error;
+  }
+  /***** Camera::HispecTrackingCamera::validate_roi ******************************/
 
   /***** Camera::HispecTrackingCamera::window_mode ***************************/
   /**

@@ -38,8 +38,12 @@ namespace Camera {
 
       // H2RG detector commands
       long h2rg_init(const std::string &args, std::string &retstring);
+      long roi(const std::string &args, std::string &retstring);
+      long roi_exec(const std::string &args, std::string &retstring);
+      long fullframe(const std::string &args, std::string &retstring);
+      long validate_roi(const std::string &args, std::string &retstring);
       long window_mode(const std::string &args, std::string &retstring);
-      long window_roi(const std::string &args, std::string &retstring);
+      long guiding_roi(const std::string &args, std::string &retstring);
 
       // Helper to send an INREG command and optionally clock it to the detector
       long send_inreg(int module, int inreg, int value);
