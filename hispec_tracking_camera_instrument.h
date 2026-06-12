@@ -35,9 +35,11 @@ namespace Camera {
     private:
       using CmdHandler = long (HispecTrackingCamera::*)(const std::string&, std::string&);
       static const std::unordered_map<std::string, CmdHandler> command_handlers_;
+      static const std::unordered_map<std::string, std::string> exposure_modes;
 
       // H2RG detector commands
       long h2rg_init(const std::string &args, std::string &retstring);
+      long exposure_mode(const std::string &args, std::string &retstring);
       long roi(const std::string &args, std::string &retstring);
       long roi_exec(const std::string &args, std::string &retstring);
       long fullframe(const std::string &args, std::string &retstring);
@@ -57,6 +59,7 @@ namespace Camera {
       int win_hstop{2047};
       int taplines_store{0};
       std::string tapline0_store;
+      std::string cur_exposure_mode;
 
       // Set in configure_instrument()
       int lvds_module{0};

@@ -14,7 +14,14 @@ namespace Camera {
   HispecTrackingCamera::command_handlers_ = {
     {"h2rg_init",   &HispecTrackingCamera::h2rg_init},
     {"window_mode", &HispecTrackingCamera::window_mode},
-    {"guiding_roi",  &HispecTrackingCamera::guiding_roi},
+    {"roi",  &HispecTrackingCamera::roi},
+  };
+  const std::unordered_map<std::string, std::string>
+  HispecTrackingCamera::exposure_modes = {
+    {"utr_rr", "mode_utr_rr"},
+    {"utr_gr", "mode_utr_gr"},
+    {"rx", "mode_rx"},
+    {"rxr", "mode_rxr"}
   };
 
   /***** Camera::HispecTrackingCamera::is_instrument_command ******************/
@@ -187,6 +194,61 @@ namespace Camera {
     return NO_ERROR;
   }
   /***** Camera::HispecTrackingCamera::h2rg_init *****************************/
+
+  /***** Camera::HispecTrackingCamera::exposure_mode ******************************/
+  /**
+   * @brief      sets the exposure mode for the camera
+   * @details    This method sets the exposure mode for the camera based on the input arguments.
+   * @param[in]  args       arguments for the exposure mode
+   * @param[out] retstring  return string
+   * @return     ERROR|NO_ERROR
+   *
+   */
+  long HispecTrackingCamera::exposure_mode(const std::string &args, std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::exposure_mode");
+    std::string dummy;
+    std::string param_cmd;
+    long error = NO_ERROR;
+
+    // validate the arguments
+    auto req_param = exposure_modes.find(args);
+    if (req_param == exposure_modes.end()) {
+      retstring = "Current exposure mode: " + this->cur_exposure_mode;
+      retstring += "\nProvide a valid exposure mode.";
+      logwrite(function, retstring);
+      return error;
+    }
+    const std::string &mode_name = req_param->first;
+    const std::string &mode_value = req_param->second;
+
+    // iterate through the arguments and set param to 0
+    for (const auto &[key, value] : exposure_modes) {
+      param_cmd = value + " 0";
+      this->set_parameter(param_cmd, dummy);
+    }
+
+    // set current exposure mode
+    param_cmd = mode_value + " 1";
+    this->set_parameter(param_cmd, dummy);
+
+    // update the exposure mode in the camera
+    this->cur_exposure_mode = mode_name;
+
+    // update cds if needed
+    if (this->cur_exposure_mode == "rxr") {
+      bool changed = false;
+      // TODO:: MODE needs to indicate what the exposure or readout type is
+      auto &mode = this->controller->modemap[this->controller->selectedmode];
+      int pixelcount = mode.geometry.pixelcount * 2;
+      this->controller->write_config_key("PIXELCOUNT", pixelcount, changed);
+      if (changed) this->controller->send_cmd(APPLYCDS);
+      mode.geometry.pixelcount = pixelcount;
+    }
+    //return retstring and error
+    retstring = "Exposure mode set";
+    return error;
+  }
+  /***** Camera::HispecTrackingCamera::exposure_mode ******************************/
 
   /***** Camera::HispecTrackingCamera::roi ******************************/
   /**
