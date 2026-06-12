@@ -15,6 +15,7 @@ namespace Camera {
     {"h2rg_init",   &HispecTrackingCamera::h2rg_init},
     {"window_mode", &HispecTrackingCamera::window_mode},
     {"roi",  &HispecTrackingCamera::roi},
+    {"exposure", &HispecTrackingCamera::exposure_mode}
   };
   const std::unordered_map<std::string, std::string>
   HispecTrackingCamera::exposure_modes = {
@@ -237,7 +238,6 @@ namespace Camera {
     // update cds if needed
     if (this->cur_exposure_mode == "rxr") {
       bool changed = false;
-      // TODO:: MODE needs to indicate what the exposure or readout type is
       auto &mode = this->controller->modemap[this->controller->selectedmode];
       int pixelcount = mode.geometry.pixelcount * 2;
       this->controller->write_config_key("PIXELCOUNT", pixelcount, changed);
@@ -343,11 +343,10 @@ namespace Camera {
     // Update CDS geometry via config keys
     bool changed = false;
     int pixelcount = cols;
-    // TODO:: MODE needs to indicate what the exposure or readout type is
     auto &mode = this->controller->modemap[this->controller->selectedmode];
-    //if (mode.samplemode == "RXR") {
-    //  pixelcount = cols * 2;
-    //}
+    if (this->cur_exposure_mode == "rxr") {
+      pixelcount = cols * 2;
+    }
     this->controller->write_config_key("PIXELCOUNT", pixelcount, changed);
     if (changed) this->controller->send_cmd(APPLYCDS);
     this->controller->write_config_key("LINECOUNT", rows, changed);
@@ -443,10 +442,9 @@ namespace Camera {
         bool changed = false;
         int pixelcount = cols;
         auto &mode = this->controller->modemap[this->controller->selectedmode];
-        //TODO: make sure rxr is identifiable
-        //if (mode == "RXR") {
-        // pixelcount = cols*2;
-        //}
+        if (this->cur_exposure_mode == "rxr") {
+          pixelcount = cols * 2;
+        }
         this->controller->write_config_key("PIXELCOUNT", cols, changed);
         if (changed) this->controller->send_cmd(APPLYCDS);
         this->controller->write_config_key("LINECOUNT", rows, changed);
