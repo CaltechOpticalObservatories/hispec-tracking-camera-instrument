@@ -215,7 +215,7 @@ namespace Camera {
     auto req_param = exposure_modes.find(args);
     if (req_param == exposure_modes.end()) {
       retstring = "Current exposure mode: " + this->cur_exposure_mode;
-      retstring += "\nProvide a valid exposure mode.";
+      retstring += "\nProvide a valid exposure mode to switch to.";
       logwrite(function, retstring);
       return error;
     }
@@ -225,12 +225,12 @@ namespace Camera {
     // iterate through the arguments and set param to 0
     for (const auto &[key, value] : exposure_modes) {
       param_cmd = value + " 0";
-      this->set_parameter(param_cmd, dummy);
+      error = this->set_parameter(param_cmd, dummy);
     }
 
     // set current exposure mode
     param_cmd = mode_value + " 1";
-    this->set_parameter(param_cmd, dummy);
+    if (error == NO_ERROR) error = this->set_parameter(param_cmd, dummy);
 
     // update the exposure mode in the camera
     this->cur_exposure_mode = mode_name;
@@ -240,12 +240,12 @@ namespace Camera {
       bool changed = false;
       auto &mode = this->controller->modemap[this->controller->selectedmode];
       int pixelcount = mode.geometry.pixelcount * 2;
-      this->controller->write_config_key("PIXELCOUNT", pixelcount, changed);
+      if (error == NO_ERROR) error = this->controller->write_config_key("PIXELCOUNT", pixelcount, changed);
       if (changed) this->controller->send_cmd(APPLYCDS);
       mode.geometry.pixelcount = pixelcount;
     }
     //return retstring and error
-    retstring = "Exposure mode set";
+    retstring = "attempted to set exposure mode to " + mode_name;
     return error;
   }
   /***** Camera::HispecTrackingCamera::exposure_mode ******************************/
