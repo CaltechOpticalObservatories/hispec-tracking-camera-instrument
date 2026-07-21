@@ -15,10 +15,10 @@ namespace Camera {
     {"h2rg_init",   &HispecTrackingCamera::h2rg_init},
     {"window_mode", &HispecTrackingCamera::window_mode},
     {"roi",  &HispecTrackingCamera::roi},
-    {"exposure", &HispecTrackingCamera::exposure_mode}
+    {"exposure", &HispecTrackingCamera::_exposure_mode}
   };
   const std::unordered_map<std::string, std::string>
-  HispecTrackingCamera::exposure_modes = {
+  HispecTrackingCamera::_exposure_modes = {
     {"utr_rr", "mode_utr_rr"},
     {"utr_gr", "mode_utr_gr"},
     {"rx", "mode_rx"},
@@ -196,7 +196,7 @@ namespace Camera {
   }
   /***** Camera::HispecTrackingCamera::h2rg_init *****************************/
 
-  /***** Camera::HispecTrackingCamera::exposure_mode ******************************/
+  /***** Camera::HispecTrackingCamera::_exposure_mode ******************************/
   /**
    * @brief      sets the exposure mode for the camera
    * @details    This method sets the exposure mode for the camera based on the input arguments.
@@ -205,15 +205,15 @@ namespace Camera {
    * @return     ERROR|NO_ERROR
    *
    */
-  long HispecTrackingCamera::exposure_mode(const std::string &args, std::string &retstring) {
-    const std::string function("Camera::HispecTrackingCamera::exposure_mode");
+  long HispecTrackingCamera::_exposure_mode(const std::string &args, std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::_exposure_mode");
     std::string dummy;
     std::string param_cmd;
     long error = NO_ERROR;
 
     // validate the arguments
-    auto req_param = exposure_modes.find(args);
-    if (req_param == exposure_modes.end()) {
+    auto req_param = _exposure_modes.find(args);
+    if (req_param == _exposure_modes.end()) {
       retstring = "Current exposure mode: " + this->cur_exposure_mode;
       retstring += "\nProvide a valid exposure mode to switch to.";
       logwrite(function, retstring);
@@ -223,7 +223,7 @@ namespace Camera {
     const std::string &mode_value = req_param->second;
 
     // iterate through the arguments and set param to 0
-    for (const auto &[key, value] : exposure_modes) {
+    for (const auto &[key, value] : _exposure_modes) {
       param_cmd = value + " 0";
       error = this->set_parameter(param_cmd, dummy);
     }
@@ -248,7 +248,7 @@ namespace Camera {
     retstring = "attempted to set exposure mode to " + mode_name;
     return error;
   }
-  /***** Camera::HispecTrackingCamera::exposure_mode ******************************/
+  /***** Camera::HispecTrackingCamera::_exposure_mode ******************************/
 
   /***** Camera::HispecTrackingCamera::roi ******************************/
   /**
