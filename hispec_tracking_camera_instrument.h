@@ -21,25 +21,32 @@ namespace Camera {
                           const std::string &args,
                           std::string &retstring) override;
 
-      bool is_instrument_command(const std::string &cmd) override;
+      bool is_instrument_command(const std::string &cmd);
 
       void configure_instrument() override;
 
       std::vector<std::string> get_exposure_modes() override;
       long set_exposure_mode(const std::string &modein, const std::vector<std::string> &modeargs) override;
 
-      std::string default_exposure_mode_name() const override {
+      std::string default_exposure_mode_name(){
         return std::string(HispecTrackingCameraExposureMode::FULLFRAME);
       }
 
     private:
       using CmdHandler = long (HispecTrackingCamera::*)(const std::string&, std::string&);
       static const std::unordered_map<std::string, CmdHandler> command_handlers_;
+      static const std::unordered_map<std::string, std::string> _exposure_modes;
 
       // H2RG detector commands
       long h2rg_init(const std::string &args, std::string &retstring);
+      long _exposure_mode(const std::string &args, std::string &retstring);
+      long mode(const std::string &args, std::string &retstring);
+      long roi(const std::string &args, std::string &retstring);
+      long roi_exec(const std::string &args, std::string &retstring);
+      long fullframe(const std::string &args, std::string &retstring);
+      long validate_roi(const std::string &args, std::string &retstring);
       long window_mode(const std::string &args, std::string &retstring);
-      long window_roi(const std::string &args, std::string &retstring);
+      long guiding_roi(const std::string &args, std::string &retstring);
 
       // Helper to send an INREG command and optionally clock it to the detector
       long send_inreg(int module, int inreg, int value);
@@ -53,6 +60,9 @@ namespace Camera {
       int win_hstop{2047};
       int taplines_store{0};
       std::string tapline0_store;
+      std::string cur_exposure_mode;
+
+      std::vector<std::unique_ptr<FrameOutput>> frame_outputs;
 
       // Set in configure_instrument()
       int lvds_module{0};
