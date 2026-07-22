@@ -40,6 +40,7 @@ namespace Camera {
       // H2RG detector commands
       long h2rg_init(const std::string &args, std::string &retstring);
       long _exposure_mode(const std::string &args, std::string &retstring);
+      long mode(const std::string &args, std::string &retstring);
       long roi(const std::string &args, std::string &retstring);
       long roi_exec(const std::string &args, std::string &retstring);
       long fullframe(const std::string &args, std::string &retstring);

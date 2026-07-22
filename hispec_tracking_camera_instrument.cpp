@@ -7,6 +7,7 @@
 
 #include "hispec_tracking_camera_instrument.h"
 #include "hispec_tracking_camera_exposure_modes.h"
+#include <iterator>
 
 namespace Camera {
 
@@ -15,7 +16,8 @@ namespace Camera {
     {"h2rg_init",   &HispecTrackingCamera::h2rg_init},
     {"window_mode", &HispecTrackingCamera::window_mode},
     {"roi",  &HispecTrackingCamera::roi},
-    {"exposure", &HispecTrackingCamera::_exposure_mode}
+    {"exposure", &HispecTrackingCamera::_exposure_mode},
+    {"mode", &HispecTrackingCamera::mode}
   };
   const std::unordered_map<std::string, std::string>
   HispecTrackingCamera::_exposure_modes = {
@@ -195,6 +197,77 @@ namespace Camera {
     return NO_ERROR;
   }
   /***** Camera::HispecTrackingCamera::h2rg_init *****************************/
+
+  /***** Camera::HispecTrackingCamera::mode **********************************
+  /**
+   * @brief      set the camera mode
+   * @details    This method sets the camera mode based on the input arguments.
+   * @param[in]  args       arguments for the camera mode
+   * @param[out] retstring  return string
+   * @return     ERROR|NO_ERROR
+   *
+   */
+  long HispecTrackingCamera::mode(const std::string &args, std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::mode");
+    std::stringstream errstr;
+    bool changed = false;
+
+    // With no argument, report the current mode instead of switching
+    if (args.empty()) {
+      retstring = "Current camera mode: " + this->controller->selectedmode;
+      retstring += "\nProvide a valid camera mode to switch to.";
+      logwrite(function, retstring);
+      return NO_ERROR;
+    }
+
+    // Let the base Archon interface select the mode. This validates the mode
+    // name, loads the mode's parameters and geometry from the ACF, and applies
+    // them (with its own APPLYCDS when the geometry changes). On success it sets
+    // controller->selectedmode to the canonical modemap key.
+    long error = this->ArchonInterface::set_camera_mode(args, retstring);
+    if (error != NO_ERROR) {
+      logwrite(function, "ERROR setting camera mode to " + args);
+      retstring = "error";
+      return ERROR;
+    }
+
+    // Use the canonical key the base class just set so our lookup always matches
+    // the modemap entry that was selected (avoids case/whitespace drift between
+    // the raw arg and how modemap was keyed).
+    auto &mode = this->controller->modemap[this->controller->selectedmode];
+
+    // set_camera_mode() only pushes geometry (LINE/PIXELCOUNT) and parameters to
+    // the Archon. The [MODE_*] section's configmap also carries the tapline
+    // layout (TAPLINES, TAPLINE0..N) and other readout keys, so stage every
+    // config key from this mode into the controller's config memory.
+    for (const auto &[key, cfg] : mode.configmap) {
+      error = this->controller->write_config_key(key.c_str(), cfg.value.c_str(), changed);
+      if (error != NO_ERROR) {
+        errstr << "ERROR writing config key " << key << "=" << cfg.value
+               << " for mode " << this->controller->selectedmode;
+        logwrite(function, errstr.str());
+        retstring = "error";
+        return ERROR;
+      }
+    }
+
+    // Activate the staged tapline/readout geometry in the CDS core. APPLYCDS
+    // reconfigures readout without power-cycling the detector (unlike APPLYALL).
+    if (changed && this->controller->send_cmd(APPLYCDS) != NO_ERROR) {
+      logwrite(function, "ERROR applying tapline configuration (APPLYCDS)");
+      retstring = "error";
+      return ERROR;
+    }
+
+    // mode.tapinfo (num_taps, ampname, readoutdir, gain, offset) is already
+    // populated for every mode at ACF-load time (ArchonController::parse_tapinfo),
+    // so it is available here via modemap[selectedmode] without re-parsing.
+
+    logwrite(function, "Camera mode set to " + this->controller->selectedmode);
+    retstring = "done";
+    return NO_ERROR;
+  }
+  /**** Camera::HispecTrackingCamera::mode **********************************/
 
   /***** Camera::HispecTrackingCamera::_exposure_mode ******************************/
   /**
