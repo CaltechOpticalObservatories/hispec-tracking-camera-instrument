@@ -340,22 +340,25 @@ namespace Camera {
    *
    */
   long HispecTrackingCamera::roi(const std::string &args, std::string &retstring) {
-    const std::string function("Camera::HispecTrackingCamera::guiding_roi");
+    const std::string function("Camera::HispecTrackingCamera::roi");
     long error = NO_ERROR;
     std::string upper_args = args;
     std::transform( upper_args.begin(), upper_args.end(), upper_args.begin(), ::toupper );  // make uppercase
+    std::vector<std::string> tokens;
+    Tokenize(args, tokens, " ");
+    logwrite(function, "roi args: " + args + " tokens: " + std::to_string(tokens.size()));
 
     // Handle different argument counts
-    if (args.size() == 4) {
+    if (tokens.size() == 4) {
       return this->guiding_roi(args, retstring);
-    } else if (args.size() == 2) {
+    } else if (tokens.size() == 2) {
       return this->roi_exec(args, retstring);
-    } else if (args.size() == 1 && upper_args == "FULLFRAME") {
+    } else if (tokens.size() == 1 && upper_args == "ROI FULLFRAME") {
       return this->fullframe(args, retstring);
     } else {
       //query current ROI
       retstring = "Current ROI: " + std::to_string(this->win_hstart) + ", " + std::to_string(this->win_vstart) + ", " + std::to_string(this->win_hstop) + ", " + std::to_string(this->win_vstop);
-      retstring += "\nProvide arguments to execute ROI command.";
+      retstring += " :: Provide arguments to execute ROI command.";
       return NO_ERROR;
     }
     return error;
