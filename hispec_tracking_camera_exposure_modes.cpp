@@ -41,9 +41,9 @@ namespace Camera {
     const auto fetch_start = std::chrono::steady_clock::now();
 
     auto* controller = hispec->controller;
-    auto* mode = &controller->modemap[controller->selectedmode];
-    const int num_detect = mode->geometry.num_detect;
-    const auto pixel_bytes = static_cast<size_t>(hispec->camera_info.image_memory * num_detect);
+    // <QF frame = 36B header + width*height*2. Size from section_size (window
+    // pixels), not image_memory (tap-folded, too big).
+    const size_t pixel_bytes = static_cast<size_t>(hispec->camera_info.section_size) * 2;
     const size_t frame_size = AUTOFETCH_HEADER_LEN + pixel_bytes;
 
     char* buf = controller->framebuf;
@@ -293,6 +293,21 @@ namespace Camera {
       return;
     }
 
+    // Trigger the exposure; in fast autofetch the Archon then streams <QF frames
+    // on its own (no FETCH/FRAME polling).
+    if (controller->expose_param.empty()) {
+      logwrite(function, "ERROR EXPOSE_PARAM not defined in configuration");
+      this->is_producer_error = true;
+      return;
+    }
+    long e = controller->prep_parameter(controller->expose_param, nseq);
+    if (e == NO_ERROR) e = controller->load_parameter(controller->expose_param, nseq);
+    if (e != NO_ERROR) {
+      logwrite(function, "ERROR failed to initiate exposure");
+      this->is_producer_error = true;
+      return;
+    }
+
     int frames_read = 0;
     for (int i = 0; i < nseq; ++i) {
       if (this->interface->is_aborted()) break;
@@ -304,11 +319,11 @@ namespace Camera {
 
       const auto idx = controller->frameinfo.index.load();
 
-      // Autofetch has no FRAME status; use the configured geometry.
-      const uint32_t fw   = hispec->camera_info.detector_pixels[0];
-      const uint32_t fh   = hispec->camera_info.detector_pixels[1];
-      const uint32_t fbpp = static_cast<uint32_t>(bpp);
-      const size_t   nbytes = static_cast<size_t>(fw) * fh * fbpp;
+      // Windowed readout geometry (naxes), matching the <QF frame size.
+      const uint32_t fw   = hispec->camera_info.naxes[0];
+      const uint32_t fh   = hispec->camera_info.naxes[1];
+      const uint32_t fbpp = 2;
+      const size_t   nbytes = static_cast<size_t>(hispec->camera_info.section_size) * fbpp;
 
       auto imagebuffer = std::make_shared<ArchonImageBuffer>();
       try { imagebuffer->rawpixels = std::shared_ptr<char[]>(new char[nbytes]); }
