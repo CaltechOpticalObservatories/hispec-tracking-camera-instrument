@@ -31,6 +31,7 @@ namespace Camera {
         : ExposureModeTemplate<Camera::ArchonInterface>(iface) { }
 
       void image_processing_thread() override;   // consumer: dispatches queued frames
+      void set_args(const std::vector<std::string> &a) { this->args = a; }
 
     protected:
       void enqueue(std::shared_ptr<ArchonImageBuffer> buf);
