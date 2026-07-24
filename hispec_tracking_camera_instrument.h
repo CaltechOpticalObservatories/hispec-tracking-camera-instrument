@@ -28,8 +28,8 @@ namespace Camera {
       std::vector<std::string> get_exposure_modes() override;
       long set_exposure_mode(const std::string &modein, const std::vector<std::string> &modeargs) override;
 
-      std::string default_exposure_mode_name(){
-        return std::string(HispecTrackingCameraExposureMode::FULLFRAME);
+      std::string default_exposure_mode_name() const override {
+        return std::string(HispecTrackingCameraExposureMode::DEFAULT);
       }
 
     private:

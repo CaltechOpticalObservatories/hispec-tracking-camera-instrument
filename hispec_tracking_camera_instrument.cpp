@@ -120,8 +120,11 @@ namespace Camera {
    */
   long HispecTrackingCamera::set_exposure_mode(const std::string &modein, const std::vector<std::string> &modeargs) {
 
-    if (modein==HispecTrackingCameraExposureMode::FULLFRAME) {
-      this->exposuremode = std::make_unique<ExposureModeFullFrame>(this);
+    if (modein==HispecTrackingCameraExposureMode::DEFAULT) {
+      if (this->is_autofetch_mode)
+        this->exposuremode = std::make_unique<ExposureModeHispecTrackingAutofetch>(this);
+      else
+        this->exposuremode = std::make_unique<ExposureModeHispecTrackingDefault>(this);
     }
     else {
       return this->ArchonInterface::set_exposure_mode(modein, modeargs);
@@ -442,7 +445,7 @@ namespace Camera {
       static_cast<uint32_t>(rows)
     };
     //resize the image buffer TODO::
-    //this->resize_image_buffer(pixelcount, rows);    
+    //this->resize_image_buffer(pixelcount, rows);
     return error;
   }
   /***** Camera::HispecTrackingCamera::roi_exec ******************************/

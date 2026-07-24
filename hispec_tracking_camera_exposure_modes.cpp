@@ -13,6 +13,8 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -21,8 +23,12 @@ namespace Camera {
   // Autofetch frame layout: 36-byte ASCII header followed by pixel data
   static constexpr int AUTOFETCH_HEADER_LEN = 36;
 
+  static size_t block_align(size_t n) {
+    return ((n + BLOCK_LEN - 1) / BLOCK_LEN) * BLOCK_LEN;
+  }
 
-  /***** Camera::ExposureModeFullFrame::read_autofetch_frame ******************/
+
+  /***** read_autofetch_frame ***********************************************/
   /**
    * @brief  Read one autofetch frame: blocks until 36-byte header + pixels
    *         arrive on the Archon socket, then parses the header
@@ -31,7 +37,7 @@ namespace Camera {
                                    Utils::TimingStats &fetch_stats,
                                    Utils::TimingStats &archon_ts_deltas,
                                    uint64_t &prev_archon_ts) {
-    const std::string function("Camera::ExposureModeFullFrame::read_autofetch_frame");
+    const std::string function("Camera::read_autofetch_frame");
     const auto fetch_start = std::chrono::steady_clock::now();
 
     auto* controller = hispec->controller;
@@ -89,16 +95,68 @@ namespace Camera {
     fetch_stats.record_since(fetch_start);
     return NO_ERROR;
   }
-  /***** Camera::ExposureModeFullFrame::read_autofetch_frame ******************/
+  /***** read_autofetch_frame ***********************************************/
 
 
-  /***** Camera::ExposureModeFullFrame::image_acquisition_thread **************/
+  /***** Camera::ExposureModeHispecTrackingBase::enqueue *********************/
+  void ExposureModeHispecTrackingBase::enqueue(std::shared_ptr<ArchonImageBuffer> buf) {
+    std::lock_guard<std::mutex> lock(this->queue_mutex);
+    this->imagebuf_queue.push(std::move(buf));
+    this->queue_cv.notify_one();
+  }
+  /***** Camera::ExposureModeHispecTrackingBase::enqueue *********************/
+
+
+  /***** Camera::ExposureModeHispecTrackingBase::image_processing_thread *****/
   /**
-   * @brief  Producer thread: validate, prep (non-autofetch), loop fetching
-   *         frames and dispatching each to the instrument's frame_outputs
+   * @brief  Consumer thread: pop each queued frame and fan it out to the
+   *         instrument's frame_outputs
    */
-  void ExposureModeFullFrame::image_acquisition_thread() {
-    const std::string function("Camera::ExposureModeFullFrame::image_acquisition_thread");
+  void ExposureModeHispecTrackingBase::image_processing_thread() {
+    const std::string function("Camera::ExposureModeHispecTrackingBase::image_processing_thread");
+    logwrite(function, "enter");
+
+    while (!this->interface->is_aborted()) {
+      std::shared_ptr<ArchonImageBuffer> buf;
+      {
+        std::unique_lock<std::mutex> lock(this->queue_mutex);
+        this->queue_cv.wait(lock, [this] {
+            return !this->imagebuf_queue.empty() || this->is_producer_finished || this->interface->is_aborted();
+            });
+        if (this->interface->is_aborted()) break;
+        if (this->imagebuf_queue.empty()) {
+          if (this->is_producer_finished) {
+            logwrite(function, "queue empty and producer finished");
+            break;
+          }
+          continue;
+        }
+        buf = this->imagebuf_queue.front();
+        this->imagebuf_queue.pop();
+      }
+
+      Camera::FrameMetadata meta;
+      meta.frame_number    = buf->bufframen_slice.empty()    ? 0 : static_cast<uint64_t>(buf->bufframen_slice[0]);
+      meta.timestamp       = buf->buftimestamp_slice.empty() ? 0 : buf->buftimestamp_slice[0];
+      meta.width           = buf->width;
+      meta.height          = buf->height;
+      meta.bytes_per_pixel = buf->bytes_per_pixel;
+      const size_t frame_bytes = static_cast<size_t>(buf->width) * buf->height * buf->bytes_per_pixel;
+      this->interface->dispatch_frame(buf->rawpixels.get(), frame_bytes, meta);
+    }
+
+    logwrite(function, "exit");
+  }
+  /***** Camera::ExposureModeHispecTrackingBase::image_processing_thread *****/
+
+
+  /***** Camera::ExposureModeHispecTrackingDefault::image_acquisition_thread */
+  /**
+   * @brief  Producer thread: trigger the exposure, then read each frame
+   *         directly into its own buffer and queue it for the consumer
+   */
+  void ExposureModeHispecTrackingDefault::image_acquisition_thread() {
+    const std::string function("Camera::ExposureModeHispecTrackingDefault::image_acquisition_thread");
     auto* hispec = static_cast<HispecTrackingCamera*>(this->interface);
     auto* controller = hispec->controller;
 
@@ -126,66 +184,147 @@ namespace Camera {
 
     auto* mode = &controller->modemap[controller->selectedmode];
     const int num_detect = mode->geometry.num_detect;
-    const int bpp = (mode->samplemode == 1) ? 4 : 2;
-    const auto pixel_bytes = static_cast<size_t>(hispec->camera_info.image_memory * num_detect);
+    const int fallback_bpp = (mode->samplemode == 1) ? 4 : 2;
 
-    Utils::TimingStats fetch_stats;
-    Utils::TimingStats archon_ts_deltas;
-    uint64_t prev_archon_ts = 0;
-
-    // Non-autofetch path: allocate framebuf and trigger an exposure on the Archon
-    if (!hispec->is_autofetch_mode) {
-      const uint32_t bufsize = static_cast<uint32_t>(
-          std::ceil(static_cast<double>(hispec->camera_info.image_memory * num_detect + BLOCK_LEN - 1) / BLOCK_LEN) * BLOCK_LEN);
-      if (controller->allocate_framebuf(bufsize) != NO_ERROR) {
-        logwrite(function, "ERROR unable to allocate frame buffer");
-        this->is_producer_error = true;
-        return;
-      }
-      long e = controller->prep_parameter(controller->expose_param, nseq);
-      if (e == NO_ERROR) e = controller->load_parameter(controller->expose_param, nseq);
-      if (e != NO_ERROR) {
-        logwrite(function, "ERROR failed to initiate exposure");
-        this->is_producer_error = true;
-        return;
-      }
+    long e = controller->prep_parameter(controller->expose_param, nseq);
+    if (e == NO_ERROR) e = controller->load_parameter(controller->expose_param, nseq);
+    if (e != NO_ERROR) {
+      logwrite(function, "ERROR failed to initiate exposure");
+      this->is_producer_error = true;
+      return;
     }
 
     int frames_read = 0;
     for (int i = 0; i < nseq; ++i) {
       if (this->interface->is_aborted()) break;
 
-      long e;
-      if (hispec->is_autofetch_mode) {
-        e = read_autofetch_frame(hispec, fetch_stats, archon_ts_deltas, prev_archon_ts);
-      }
-      else {
-        e = controller->wait_for_readout();
-        if (e == NO_ERROR) {
-          // read_frame mutates its second arg; pass a local copy to preserve framebuf
-          char* imagebuf = controller->framebuf;
-          e = controller->read_frame(ArchonController::FRAME_IMAGE, imagebuf);
-        }
-        if (e != NO_ERROR) logwrite(function, "ERROR reading frame from controller");
-      }
-      if (e != NO_ERROR) {
+      if (controller->wait_for_readout() == ERROR) {
         this->is_producer_error = true;
         break;
       }
 
-      const char* pixel_data = hispec->is_autofetch_mode
-        ? controller->framebuf + AUTOFETCH_HEADER_LEN
-        : controller->framebuf;
+      const auto idx = controller->frameinfo.index.load();
+
+      // Geometry from the Archon-reported buffer dimensions (BUFnWIDTH/HEIGHT).
+      uint32_t fw   = static_cast<uint32_t>(controller->frameinfo.bufwidth[idx]);
+      uint32_t fh   = static_cast<uint32_t>(controller->frameinfo.bufheight[idx]);
+      uint32_t fbpp = (controller->frameinfo.bufsample[idx] == 1) ? 4u : 2u;
+      if (fw == 0 || fh == 0) {
+        fw   = hispec->camera_info.detector_pixels[0];
+        fh   = hispec->camera_info.detector_pixels[1];
+        fbpp = static_cast<uint32_t>(fallback_bpp);
+      }
+      if (i == 0) {
+        logwrite(function, "frame geometry " + std::to_string(fw) + "x" +
+                 std::to_string(fh) + " bpp=" + std::to_string(fbpp));
+      }
+
+      // Size the buffer to the whole block-aligned frame and read straight into it.
+      const size_t raw    = static_cast<size_t>(fw) * fh * fbpp * num_detect;
+      const size_t nbytes = block_align(raw);
+      auto imagebuffer = std::make_shared<ArchonImageBuffer>();
+      try { imagebuffer->rawpixels = std::shared_ptr<char[]>(new char[nbytes]); }
+      catch (const std::exception &ex) {
+        logwrite(function, "ERROR allocating image buffer: " + std::string(ex.what()));
+        this->is_producer_error = true;
+        break;
+      }
+      char* p = imagebuffer->rawpixels.get();
+      if (controller->read_frame(ArchonController::FRAME_IMAGE, p) == ERROR) {
+        logwrite(function, "ERROR reading frame from controller");
+        this->is_producer_error = true;
+        break;
+      }
+      imagebuffer->width           = fw;
+      imagebuffer->height          = fh;
+      imagebuffer->bytes_per_pixel = fbpp;
+      imagebuffer->bufframen_slice.push_back(controller->frameinfo.bufframen[idx]);
+      imagebuffer->buftimestamp_slice.push_back(controller->frameinfo.buftimestamp[idx]);
+      this->enqueue(std::move(imagebuffer));
+      ++frames_read;
+    }
+
+    logwrite(function, "sequence complete: " + std::to_string(frames_read) +
+             " of " + std::to_string(nseq) + " frames");
+  }
+  /***** Camera::ExposureModeHispecTrackingDefault::image_acquisition_thread */
+
+
+  /***** Camera::ExposureModeHispecTrackingAutofetch::image_acquisition_thread */
+  /**
+   * @brief  Producer thread: stream frames from the Archon (header + pixels)
+   *         into framebuf, copy each into its own buffer, and queue it
+   */
+  void ExposureModeHispecTrackingAutofetch::image_acquisition_thread() {
+    const std::string function("Camera::ExposureModeHispecTrackingAutofetch::image_acquisition_thread");
+    auto* hispec = static_cast<HispecTrackingCamera*>(this->interface);
+    auto* controller = hispec->controller;
+
+    if (controller->selectedmode.empty()) {
+      logwrite(function, "ERROR no mode selected");
+      this->is_producer_error = true;
+      return;
+    }
+
+    int nseq = 1;
+    const std::string args = this->get_args_string();
+    if (!args.empty()) {
+      try { nseq = std::stoi(args); }
+      catch (const std::exception &e) {
+        logwrite(function, "ERROR invalid sequence count: " + args);
+        this->is_producer_error = true;
+        return;
+      }
+    }
+
+    auto* mode = &controller->modemap[controller->selectedmode];
+    const int num_detect = mode->geometry.num_detect;
+    const int bpp = (mode->samplemode == 1) ? 4 : 2;
+
+    Utils::TimingStats fetch_stats;
+    Utils::TimingStats archon_ts_deltas;
+    uint64_t prev_archon_ts = 0;
+
+    const uint32_t bufsize = static_cast<uint32_t>(
+        block_align(hispec->camera_info.image_memory * num_detect + AUTOFETCH_HEADER_LEN));
+    if (controller->allocate_framebuf(bufsize) != NO_ERROR) {
+      logwrite(function, "ERROR unable to allocate frame buffer");
+      this->is_producer_error = true;
+      return;
+    }
+
+    int frames_read = 0;
+    for (int i = 0; i < nseq; ++i) {
+      if (this->interface->is_aborted()) break;
+
+      if (read_autofetch_frame(hispec, fetch_stats, archon_ts_deltas, prev_archon_ts) != NO_ERROR) {
+        this->is_producer_error = true;
+        break;
+      }
 
       const auto idx = controller->frameinfo.index.load();
-      Camera::FrameMetadata meta;
-      meta.frame_number    = controller->frameinfo.bufframen[idx];
-      meta.timestamp       = controller->frameinfo.buftimestamp[idx];
-      meta.width           = mode->geometry.pixelcount;
-      meta.height          = mode->geometry.linecount;
-      meta.bytes_per_pixel = bpp;
 
-      hispec->dispatch_frame(pixel_data, pixel_bytes, meta);
+      // Autofetch has no FRAME status; use the configured geometry.
+      const uint32_t fw   = hispec->camera_info.detector_pixels[0];
+      const uint32_t fh   = hispec->camera_info.detector_pixels[1];
+      const uint32_t fbpp = static_cast<uint32_t>(bpp);
+      const size_t   nbytes = static_cast<size_t>(fw) * fh * fbpp;
+
+      auto imagebuffer = std::make_shared<ArchonImageBuffer>();
+      try { imagebuffer->rawpixels = std::shared_ptr<char[]>(new char[nbytes]); }
+      catch (const std::exception &ex) {
+        logwrite(function, "ERROR allocating image buffer: " + std::string(ex.what()));
+        this->is_producer_error = true;
+        break;
+      }
+      std::memcpy(imagebuffer->rawpixels.get(),
+                  controller->framebuf + AUTOFETCH_HEADER_LEN, nbytes);
+      imagebuffer->width           = fw;
+      imagebuffer->height          = fh;
+      imagebuffer->bytes_per_pixel = fbpp;
+      imagebuffer->bufframen_slice.push_back(controller->frameinfo.bufframen[idx]);
+      imagebuffer->buftimestamp_slice.push_back(controller->frameinfo.buftimestamp[idx]);
+      this->enqueue(std::move(imagebuffer));
       ++frames_read;
     }
 
@@ -198,6 +337,6 @@ namespace Camera {
     logwrite(function, "sequence complete: " + std::to_string(frames_read) +
              " of " + std::to_string(nseq) + " frames");
   }
-  /***** Camera::ExposureModeFullFrame::image_acquisition_thread **************/
+  /***** Camera::ExposureModeHispecTrackingAutofetch::image_acquisition_thread */
 
 }
