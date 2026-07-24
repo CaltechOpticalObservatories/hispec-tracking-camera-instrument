@@ -62,8 +62,6 @@ namespace Camera {
       std::string tapline0_store;
       std::string cur_exposure_mode;
 
-      std::vector<std::unique_ptr<FrameOutput>> frame_outputs;
-
       // Set in configure_instrument()
       int lvds_module{0};
       int h2rg_max_pixel{0};
