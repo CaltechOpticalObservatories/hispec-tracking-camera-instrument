@@ -17,6 +17,7 @@ namespace Camera {
     {"window_mode", &HispecTrackingCamera::window_mode},
     {"roi",  &HispecTrackingCamera::roi},
     {"exposure", &HispecTrackingCamera::_exposure_mode},
+    {"autofetch_mode", &HispecTrackingCamera::_autofetch_mode},
     {"mode", &HispecTrackingCamera::mode}
   };
   const std::unordered_map<std::string, std::string>
@@ -133,6 +134,42 @@ namespace Camera {
     return NO_ERROR;
   }
   /***** Camera::HispecTrackingCamera::set_exposure_mode **********************/
+
+
+  /***** Camera::HispecTrackingCamera::_autofetch_mode ***********************/
+  /**
+   * @brief  toggle autofetch, then re-select the exposure pipeline so the
+   *         autofetch/default class matches the new state
+   */
+  long HispecTrackingCamera::_autofetch_mode(const std::string &args, std::string &retstring) {
+    long error = this->ArchonInterface::autofetch_mode(args, retstring);
+    if (error == NO_ERROR && !args.empty()) {
+      error = this->set_exposure_mode(this->default_exposure_mode_name(), {});
+    }
+    return error;
+  }
+  /***** Camera::HispecTrackingCamera::_autofetch_mode ***********************/
+
+
+  /***** Camera::HispecTrackingCamera::expose ********************************/
+  /**
+   * @brief  Autofetch streams continuously, so run one producer session for all
+   *         frames; non-autofetch keeps the base per-frame expose loop
+   */
+  long HispecTrackingCamera::expose(const std::string args, std::string &retstring) {
+    if (!this->is_autofetch_mode) {
+      return this->ArchonInterface::expose(args, retstring);
+    }
+    const std::string function("Camera::HispecTrackingCamera::expose");
+    if (!this->controller->is_connected) { logwrite(function, "ERROR not connected to controller"); return ERROR; }
+    if (!this->controller->is_powered)   { logwrite(function, "ERROR power is not on"); return ERROR; }
+    if (!this->is_exposuremode_set())    { logwrite(function, "ERROR exposure mode not set"); return ERROR; }
+    if (auto* m = dynamic_cast<ExposureModeHispecTrackingBase*>(this->exposuremode.get())) {
+      m->set_args({args});
+    }
+    return this->do_expose();
+  }
+  /***** Camera::HispecTrackingCamera::expose ********************************/
 
 
   /***** Camera::HispecTrackingCamera::send_inreg ****************************/

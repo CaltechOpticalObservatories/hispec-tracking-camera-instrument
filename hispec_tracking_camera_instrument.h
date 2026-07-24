@@ -27,6 +27,7 @@ namespace Camera {
 
       std::vector<std::string> get_exposure_modes() override;
       long set_exposure_mode(const std::string &modein, const std::vector<std::string> &modeargs) override;
+      long expose(const std::string args, std::string &retstring) override;
 
       std::string default_exposure_mode_name() const override {
         return std::string(HispecTrackingCameraExposureMode::DEFAULT);
@@ -40,6 +41,7 @@ namespace Camera {
       // H2RG detector commands
       long h2rg_init(const std::string &args, std::string &retstring);
       long _exposure_mode(const std::string &args, std::string &retstring);
+      long _autofetch_mode(const std::string &args, std::string &retstring);
       long mode(const std::string &args, std::string &retstring);
       long roi(const std::string &args, std::string &retstring);
       long roi_exec(const std::string &args, std::string &retstring);
