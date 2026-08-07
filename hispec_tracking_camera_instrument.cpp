@@ -358,7 +358,7 @@ namespace Camera {
       mode.geometry.pixelcount = pixelcount;
     }
     //return retstring and error
-    retstring = "attempted to set exposure mode to " + mode_name;
+    retstring = mode_name;
     return error;
   }
   /***** Camera::HispecTrackingCamera::_exposure_mode ******************************/
