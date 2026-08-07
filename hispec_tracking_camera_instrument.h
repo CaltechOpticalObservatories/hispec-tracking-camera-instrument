@@ -10,6 +10,7 @@
 #include "frame_output_factory.h"
 #include "hispec_tracking_camera_exposure_modes.h"
 
+#include <atomic>
 #include <string>
 #include <unordered_map>
 
@@ -50,6 +51,9 @@ namespace Camera {
       long window_mode(const std::string &args, std::string &retstring);
       long guiding_roi(const std::string &args, std::string &retstring);
 
+      long freerun(const std::string &args, std::string &retstring);
+      long _debug(const std::string &args, std::string &retstring);
+
       // Helper to send an INREG command and optionally clock it to the detector
       long send_inreg(int module, int inreg, int value);
       long send_inreg_clocked(int module, int inreg, int value);
@@ -67,6 +71,10 @@ namespace Camera {
       // Set in configure_instrument()
       int lvds_module{0};
       int h2rg_max_pixel{0};
+
+      bool is_freerunning{false};
+      std::atomic<bool> is_freerun_active{false};  //!< true while the background freerun loop is running
+      bool is_debug{false};
   };
 
 }

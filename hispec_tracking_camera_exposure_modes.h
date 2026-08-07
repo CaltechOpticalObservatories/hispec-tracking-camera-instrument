@@ -32,6 +32,9 @@ namespace Camera {
 
       void image_processing_thread() override;   // consumer: dispatches queued frames
       void set_args(const std::vector<std::string> &a) { this->args = a; }
+      void set_debug(bool d) { this->is_debug = d; }
+
+      bool is_debug{false};  //!< true to log per-frame debug info in the producer thread
 
     protected:
       void enqueue(std::shared_ptr<ArchonImageBuffer> buf);

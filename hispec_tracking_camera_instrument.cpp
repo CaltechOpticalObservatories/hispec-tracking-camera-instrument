@@ -171,6 +171,88 @@ namespace Camera {
   }
   /***** Camera::HispecTrackingCamera::expose ********************************/
 
+  /***** Camera::HispecTrackingCamera::freerun ********************************/
+  /**
+   * @brief      start the freerun exposure loop
+   * @details    This method starts the freerun exposure loop in the background.
+   * @param[in]  args       arguments for the freerun mode
+   * @param[out] retstring  return string
+   * @return     ERROR|NO_ERROR
+   *
+   */
+  long HispecTrackingCamera::freerun(const std::string &args, std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::freerun");
+    long error = NO_ERROR;
+    // Preps archon and camera-interface for freerun mode
+     if (args.empty()) {
+      retstring = "ERROR: freerun requires an argument";
+      logwrite(function, retstring);
+      return ERROR;
+    }
+    const std::string value = args;
+    std::string param_cmd = "freerun " +  value;  // e.g. "freerun 1" or "freerun 0"
+    std::string dummy;
+    error = this->set_parameter(param_cmd, dummy);
+    this->is_freerunning = (value=="1");
+
+    return error;
+  }
+  /***** Camera::HispecTrackingCamera::freerun ********************************/
+
+  /***** Camera::HispecTrackingCamera::_debug ********************************/
+  /**
+   * @brief      enable or disable per-frame debug logging
+   * @details    Every informational logwrite() in the hispec acquisition and
+   *             processing threads is gated on this, as is timing-statistics
+   *             collection. Logging serializes on a mutex and hits the disk, so
+   *             leaving it on measurably slows acquisition and processing --
+   *             hence off by default. Errors are logged either way.
+   *
+   *             The setting is kept on the instrument and pushed into the
+   *             exposure mode, so it survives an exposure mode change, and it
+   *             can be toggled while an exposure or freerun loop is running.
+   *
+   * @param[in]  args       "true"|"1" to enable, "false"|"0" to disable, empty to query
+   * @param[out] retstring  current state ("true" or "false")
+   * @return     ERROR|NO_ERROR|HELP
+   *
+   */
+  long HispecTrackingCamera::_debug(const std::string &args, std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::_debug");
+
+    if (args=="?" || args=="help") {
+      retstring = "debug [ true | false ]\n";
+      retstring.append( "  Enable or disable per-frame debug logging for the hispec\n" );
+      retstring.append( "  exposure threads. Off by default to avoid blowing up logs,\n" );
+      retstring.append( "  and hinderingacquisition and processing. Errors are always\n" );
+      retstring.append( "  logged. With no argument, returns the current state.\n" );
+      return HELP;
+    }
+
+    if (!args.empty()) {
+      std::string state = args;
+      std::transform(state.begin(), state.end(), state.begin(), ::toupper);
+
+      if      (state=="TRUE"  || state=="1") this->is_debug = true;
+      else if (state=="FALSE" || state=="0") this->is_debug = false;
+      else {
+        retstring = "ERROR expected true|false";
+        logwrite(function, retstring);
+        return ERROR;
+      }
+
+      // applies to the running exposure mode immediately
+      if (auto* m = dynamic_cast<ExposureModeHispecTrackingBase*>(this->exposuremode.get())) {
+        m->set_debug(this->is_debug);
+      }
+      logwrite(function, this->is_debug ? "debug logging enabled" : "debug logging disabled");
+    }
+
+    retstring = (this->is_debug ? "true" : "false");
+    return NO_ERROR;
+  }
+  /***** Camera::HispecTrackingCamera::_debug ********************************/
+
 
   /***** Camera::HispecTrackingCamera::send_inreg ****************************/
   /**

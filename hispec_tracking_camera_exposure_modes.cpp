@@ -149,7 +149,6 @@ namespace Camera {
   }
   /***** Camera::ExposureModeHispecTrackingBase::image_processing_thread *****/
 
-
   /***** Camera::ExposureModeHispecTrackingDefault::image_acquisition_thread */
   /**
    * @brief  Producer thread: trigger the exposure, then read each frame
