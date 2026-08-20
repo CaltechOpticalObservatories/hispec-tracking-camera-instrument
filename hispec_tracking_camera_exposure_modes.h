@@ -13,6 +13,8 @@
 #include <memory>
 #include <queue>
 
+namespace Common { class FitsKeys; }
+
 namespace Camera {
 
   namespace HispecTrackingCameraExposureMode {
@@ -35,7 +37,12 @@ namespace Camera {
 
     protected:
       void enqueue(std::shared_ptr<ArchonImageBuffer> buf);
+      // Built once at the start of image_acquisition_thread(), read by image_processing_thread()
+      std::shared_ptr<Common::FitsKeys> build_header_set(const std::string &operational_mode,
+                                                          const std::string &subframe_mode,
+                                                          bool is_freerun);
       std::queue<std::shared_ptr<ArchonImageBuffer>> imagebuf_queue;
+      std::shared_ptr<const Common::FitsKeys> header_set;
   };
 
   // Default: one frame per readout, read straight into its own buffer.

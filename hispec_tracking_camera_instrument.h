@@ -33,6 +33,10 @@ namespace Camera {
         return std::string(HispecTrackingCameraExposureMode::DEFAULT);
       }
 
+      bool is_windowed() const { return is_window; }
+      int window_vstart() const { return win_vstart; }
+      int window_hstart() const { return win_hstart; }
+
     private:
       using CmdHandler = long (HispecTrackingCamera::*)(const std::string&, std::string&);
       static const std::unordered_map<std::string, CmdHandler> command_handlers_;
