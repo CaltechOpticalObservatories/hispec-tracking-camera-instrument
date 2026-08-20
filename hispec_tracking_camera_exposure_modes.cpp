@@ -7,10 +7,14 @@
 
 #include "archon_controller.h"
 #include "archon_exposure_modes.h"
+#include "common.h"
+#include "fits_header_dictionary.h"
 #include "hispec_tracking_camera_exposure_modes.h"
 #include "hispec_tracking_camera_instrument.h"
 #include "timing_stats.h"
+#include "utilities.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -19,6 +23,62 @@
 #include <string>
 
 namespace Camera {
+
+  namespace {
+    constexpr FitsCamera THIS_CAMERA = FitsCamera::ATC;
+
+    // Resolve property's value (falling back to its dictionary default),
+    // validate/normalize enums, and add it under its dictionary keyword.
+    // Empty result or "N/A" (not applicable to this camera) writes nothing.
+    void set_dict_value(Common::FitsKeys &keys, const std::string &property,
+                         const std::string &value) {
+      const auto *entry = find_header_entry(property);
+      if (!entry) return;
+
+      std::string resolved = value.empty() ? header_default(*entry, THIS_CAMERA) : value;
+      if (resolved.empty() || resolved == "N/A") return;
+
+      switch (entry->type) {
+        case HeaderValueType::Number:
+          try { keys.addkey(entry->keyword, std::stod(resolved), entry->comment); }
+          catch (const std::exception &e) {
+            logwrite("Camera::set_dict_value", "ERROR " + entry->keyword + ": " + e.what());
+          }
+          break;
+        case HeaderValueType::Integer:
+          try { keys.addkey(entry->keyword, std::stol(resolved), entry->comment); }
+          catch (const std::exception &e) {
+            logwrite("Camera::set_dict_value", "ERROR " + entry->keyword + ": " + e.what());
+          }
+          break;
+        case HeaderValueType::Boolean:
+          keys.addkey(entry->keyword, (resolved == "TRUE" || resolved == "T"), entry->comment);
+          break;
+        case HeaderValueType::String: {
+          std::string normalized = resolved;
+          std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                          [](unsigned char c) { return std::toupper(c); });
+          if (entry->enum_values.empty()) {
+            keys.addkey(entry->keyword, resolved, entry->comment);
+          } else if (is_valid_header_enum(*entry, normalized)) {
+            keys.addkey(entry->keyword, normalized, entry->comment);
+          } else {
+            logwrite("Camera::set_dict_value",
+                     "ERROR invalid value for " + entry->keyword + ": " + resolved);
+          }
+          break;
+        }
+      }
+    }
+
+    std::string subframe_mode_for(HispecTrackingCamera *hispec) {
+      if (!hispec->is_windowed()) return "fullframe";
+      std::string mode = hispec->controller->selectedmode;
+      std::transform(mode.begin(), mode.end(), mode.begin(),
+                      [](unsigned char c) { return std::toupper(c); });
+      return (mode.find("GUID") != std::string::npos) ? "guiding" : "ROI";
+    }
+  }
 
   // Autofetch frame layout: 36-byte ASCII header followed by pixel data
   static constexpr int AUTOFETCH_HEADER_LEN = 36;
@@ -107,6 +167,60 @@ namespace Camera {
   /***** Camera::ExposureModeHispecTrackingBase::enqueue *********************/
 
 
+  /***** Camera::ExposureModeHispecTrackingBase::build_header_set ************/
+  std::shared_ptr<Common::FitsKeys> ExposureModeHispecTrackingBase::build_header_set(
+      const std::string &operational_mode, const std::string &subframe_mode, bool is_freerun) {
+    auto* hispec = static_cast<HispecTrackingCamera*>(this->interface);
+    auto* controller = hispec->controller;
+    auto keys = std::make_shared<Common::FitsKeys>();
+
+    for (const auto &e : hispec->camera_info.systemkeys.keydb) keys->keydb[e.first] = e.second;
+    for (const auto &e : hispec->camera_info.userkeys.keydb)   keys->keydb[e.first] = e.second;
+
+    set_dict_value(*keys, "operational_mode", operational_mode);
+    set_dict_value(*keys, "subframe_mode", subframe_mode);
+    set_dict_value(*keys, "FREERUN", is_freerun ? "TRUE" : "FALSE");
+    set_dict_value(*keys, "file_type", "");
+    set_dict_value(*keys, "bitpix", std::to_string(hispec->camera_info.bitpix));
+    set_dict_value(*keys, "ref_channel_position", "");
+    set_dict_value(*keys, "refpix_channel", "");
+    set_dict_value(*keys, "clock_rate", "");
+    set_dict_value(*keys, "pixel_time", "");
+
+    if (hispec->is_windowed()) {
+      set_dict_value(*keys, "nskip_rows", std::to_string(hispec->window_vstart()));
+      set_dict_value(*keys, "nskip_lines", std::to_string(hispec->window_hstart()));
+    } else {
+      set_dict_value(*keys, "nskip_rows", "0");
+      set_dict_value(*keys, "nskip_lines", "0");
+    }
+
+    if (!controller->selectedmode.empty()) {
+      auto &mode = controller->modemap[controller->selectedmode];
+      if (auto it = mode.acfkeys.keydb.find("READOUTMODE"); it != mode.acfkeys.keydb.end())
+        set_dict_value(*keys, "read_mode", it->second.keyvalue);
+      if (mode.geometry.num_detect > 0)
+        set_dict_value(*keys, "n_channels", std::to_string(mode.geometry.num_detect));
+      else
+        set_dict_value(*keys, "n_channels", "");
+    }
+
+    // Bias voltages: MOD10/LVLC_Vn in the ACF's global [CONFIG] section
+    if (auto it = controller->configmap.find("MOD10/LVLC_V1"); it != controller->configmap.end())
+      set_dict_value(*keys, "LVLC_V1", it->second.value);
+    if (auto it = controller->configmap.find("MOD10/LVLC_V2"); it != controller->configmap.end())
+      set_dict_value(*keys, "LVLC_V2", it->second.value);
+    if (auto it = controller->configmap.find("MOD10/LVLC_V3"); it != controller->configmap.end())
+      set_dict_value(*keys, "LVLC_V3", it->second.value);
+
+    keys->addkey("CAMD_VER", std::string(__DATE__) + " " + std::string(__TIME__),
+                 "camerad build date");
+
+    return keys;
+  }
+  /***** Camera::ExposureModeHispecTrackingBase::build_header_set ************/
+
+
   /***** Camera::ExposureModeHispecTrackingBase::image_processing_thread *****/
   /**
    * @brief  Consumer thread: pop each queued frame and fan it out to the
@@ -115,6 +229,9 @@ namespace Camera {
   void ExposureModeHispecTrackingBase::image_processing_thread() {
     const std::string function("Camera::ExposureModeHispecTrackingBase::image_processing_thread");
     logwrite(function, "enter");
+
+    auto* hispec = static_cast<HispecTrackingCamera*>(this->interface);
+    uint64_t sequence_number = 0;
 
     while (!this->interface->is_aborted()) {
       std::shared_ptr<ArchonImageBuffer> buf;
@@ -141,6 +258,16 @@ namespace Camera {
       meta.width           = buf->width;
       meta.height          = buf->height;
       meta.bytes_per_pixel = buf->bytes_per_pixel;
+      meta.sequence_number = sequence_number++;
+
+      // No multi-read exposure mode exists yet (see FITS-HEADERS-AND-CUBE-PLAN.md D2.1);
+      // one queued buffer is one whole exposure, so these are per-exposure, not summed.
+      meta.mjd_start          = mjd_now();
+      meta.acq_time           = get_timestamp();
+      meta.exposure_time_sec  = hispec->camera_info.exposure_time->get();
+      meta.n_reads            = 1;
+      meta.header_set         = this->header_set;
+
       const size_t frame_bytes = static_cast<size_t>(buf->width) * buf->height * buf->bytes_per_pixel;
       this->interface->dispatch_frame(buf->rawpixels.get(), frame_bytes, meta);
     }
@@ -170,6 +297,9 @@ namespace Camera {
       this->is_producer_error = true;
       return;
     }
+
+    this->header_set = build_header_set(HispecTrackingCameraExposureMode::DEFAULT,
+                                         subframe_mode_for(hispec), false);
 
     int nseq = 1;
     const std::string args = this->get_args_string();
@@ -265,6 +395,9 @@ namespace Camera {
       this->is_producer_error = true;
       return;
     }
+
+    this->header_set = build_header_set(HispecTrackingCameraExposureMode::AUTOFETCH,
+                                         subframe_mode_for(hispec), false);
 
     int nseq = 1;
     const std::string args = this->get_args_string();
