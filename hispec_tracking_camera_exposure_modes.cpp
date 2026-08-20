@@ -18,7 +18,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <iomanip>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -77,6 +79,13 @@ namespace Camera {
       std::transform(mode.begin(), mode.end(), mode.begin(),
                       [](unsigned char c) { return std::toupper(c); });
       return (mode.find("GUID") != std::string::npos) ? "guiding" : "ROI";
+    }
+
+    // std::to_string(double) truncates to 6 decimals; round-trip full precision instead
+    std::string precise(double value) {
+      std::ostringstream oss;
+      oss << std::setprecision(15) << value;
+      return oss.str();
     }
   }
 
@@ -259,14 +268,17 @@ namespace Camera {
       meta.height          = buf->height;
       meta.bytes_per_pixel = buf->bytes_per_pixel;
       meta.sequence_number = sequence_number++;
+      meta.header_set      = this->header_set;
 
       // No multi-read exposure mode exists yet (see FITS-HEADERS-AND-CUBE-PLAN.md D2.1);
       // one queued buffer is one whole exposure, so these are per-exposure, not summed.
-      meta.mjd_start          = mjd_now();
-      meta.acq_time           = get_timestamp();
-      meta.exposure_time_sec  = hispec->camera_info.exposure_time->get();
-      meta.n_reads            = 1;
-      meta.header_set         = this->header_set;
+      auto frame_keys = std::make_shared<Common::FitsKeys>();
+      set_dict_value(*frame_keys, "mjd_start", precise(mjd_now()));
+      set_dict_value(*frame_keys, "acq_time", get_timestamp());
+      set_dict_value(*frame_keys, "exposure_time",
+                      precise(hispec->camera_info.exposure_time->get()));
+      set_dict_value(*frame_keys, "n_reads", "1");
+      meta.frame_keys = std::move(frame_keys);
 
       const size_t frame_bytes = static_cast<size_t>(buf->width) * buf->height * buf->bytes_per_pixel;
       this->interface->dispatch_frame(buf->rawpixels.get(), frame_bytes, meta);
