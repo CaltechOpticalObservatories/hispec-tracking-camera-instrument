@@ -167,7 +167,9 @@ namespace Camera {
     if (auto* m = dynamic_cast<ExposureModeHispecTrackingBase*>(this->exposuremode.get())) {
       m->set_args({args});
     }
-    return this->do_expose();
+    long error = this->do_expose();
+    this->end_exposure();
+    return error;
   }
   /***** Camera::HispecTrackingCamera::expose ********************************/
 
