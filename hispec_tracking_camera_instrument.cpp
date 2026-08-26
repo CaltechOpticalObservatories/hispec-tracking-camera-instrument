@@ -75,17 +75,23 @@ namespace Camera {
     this->controller->archon.set_tcp_nodelay(true);
     this->controller->archon.set_recv_buf_size(socket_buf_size);
     this->controller->archon.set_send_buf_size(socket_buf_size);
+  }
+  /***** Camera::HispecTrackingCamera::configure_instrument *******************/
 
-    Camera::FrameOutputsConfig fo_cfg;
+
+  /***** Camera::HispecTrackingCamera::frame_output_defaults ******************/
+  /**
+   * @brief      instrument-specific frame_outputs defaults, applied before
+   *             the config file so a .cfg entry still overrides these
+   *
+   */
+  void HispecTrackingCamera::frame_output_defaults(FrameOutputsConfig &fo_cfg) {
     fo_cfg.shm_enabled         = true;
     fo_cfg.shm_segment_name    = "hispec_tracking_camera";
     fo_cfg.shm_max_frame_bytes = static_cast<size_t>(
         (this->h2rg_max_pixel + 1) * (this->h2rg_max_pixel + 1) * 4);
-
-    Camera::apply_config_overrides(fo_cfg, this->configfile);
-    this->frame_outputs = Camera::make_frame_outputs(fo_cfg);
   }
-  /***** Camera::HispecTrackingCamera::configure_instrument *******************/
+  /***** Camera::HispecTrackingCamera::frame_output_defaults ******************/
 
 
   /***** Camera::HispecTrackingCamera::get_exposure_modes *********************/
