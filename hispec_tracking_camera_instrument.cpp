@@ -79,21 +79,6 @@ namespace Camera {
   /***** Camera::HispecTrackingCamera::configure_instrument *******************/
 
 
-  /***** Camera::HispecTrackingCamera::frame_output_defaults ******************/
-  /**
-   * @brief      instrument-specific frame_outputs defaults, applied before
-   *             the config file so a .cfg entry still overrides these
-   *
-   */
-  void HispecTrackingCamera::frame_output_defaults(FrameOutputsConfig &fo_cfg) {
-    fo_cfg.shm_enabled         = true;
-    fo_cfg.shm_segment_name    = "hispec_tracking_camera";
-    fo_cfg.shm_max_frame_bytes = static_cast<size_t>(
-        (this->h2rg_max_pixel + 1) * (this->h2rg_max_pixel + 1) * 4);
-  }
-  /***** Camera::HispecTrackingCamera::frame_output_defaults ******************/
-
-
   /***** Camera::HispecTrackingCamera::get_exposure_modes *********************/
   /**
    * @brief      return a vector of strings of recognized exposure modes

@@ -7,7 +7,6 @@
 #pragma once
 
 #include "archon_interface.h"
-#include "frame_output_factory.h"
 #include "hispec_tracking_camera_exposure_modes.h"
 
 #include <string>
@@ -24,7 +23,6 @@ namespace Camera {
       bool is_instrument_command(const std::string &cmd);
 
       void configure_instrument() override;
-      void frame_output_defaults(FrameOutputsConfig &fo_cfg) override;
 
       std::vector<std::string> get_exposure_modes() override;
       long set_exposure_mode(const std::string &modein, const std::vector<std::string> &modeargs) override;
