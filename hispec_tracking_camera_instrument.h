@@ -7,7 +7,6 @@
 #pragma once
 
 #include "archon_interface.h"
-#include "frame_output_factory.h"
 #include "hispec_tracking_camera_exposure_modes.h"
 
 #include <string>
