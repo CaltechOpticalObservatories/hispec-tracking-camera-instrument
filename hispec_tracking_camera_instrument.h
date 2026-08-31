@@ -9,6 +9,7 @@
 #include "archon_interface.h"
 #include "hispec_tracking_camera_exposure_modes.h"
 
+#include <atomic>
 #include <string>
 #include <unordered_map>
 
@@ -27,6 +28,14 @@ namespace Camera {
       std::vector<std::string> get_exposure_modes() override;
       long set_exposure_mode(const std::string &modein, const std::vector<std::string> &modeargs) override;
       long expose(const std::string args, std::string &retstring) override;
+
+      /**
+       * @brief  abort, and tear down a freerun session if one is running
+       * @details  The base abort sets the abort state, which both freerun loops
+       *           watch. This then joins them, so when abort returns the session
+       *           is fully stopped and freerun can be restarted immediately.
+       */
+      long abort(const std::string args, std::string &retstring) override;
 
       std::string default_exposure_mode_name() const override {
         return std::string(HispecTrackingCameraExposureMode::DEFAULT);
@@ -53,6 +62,10 @@ namespace Camera {
       long window_mode(const std::string &args, std::string &retstring);
       long guiding_roi(const std::string &args, std::string &retstring);
 
+      long freerun(const std::string &args, std::string &retstring);
+      long _debug(const std::string &args, std::string &retstring);
+      long _take_stats(const std::string &args, std::string &retstring);
+
       // Helper to send an INREG command and optionally clock it to the detector
       long send_inreg(int module, int inreg, int value);
       long send_inreg_clocked(int module, int inreg, int value);
@@ -70,6 +83,11 @@ namespace Camera {
       // Set in configure_instrument()
       int lvds_module{0};
       int h2rg_max_pixel{0};
+
+      bool is_freerunning{false};
+      std::atomic<bool> is_freerun_active{false};  //!< true while the background freerun loop is running
+      bool is_debug{false};
+      bool take_stats{false};
   };
 
 }

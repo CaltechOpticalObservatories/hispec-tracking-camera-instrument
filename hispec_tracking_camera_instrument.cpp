@@ -18,7 +18,10 @@ namespace Camera {
     {"roi",  &HispecTrackingCamera::roi},
     {"exposure", &HispecTrackingCamera::_exposure_mode},
     {"autofetch_mode", &HispecTrackingCamera::_autofetch_mode},
-    {"mode", &HispecTrackingCamera::mode}
+    {"mode", &HispecTrackingCamera::mode},
+    {"freerun", &HispecTrackingCamera::freerun},
+    {"debug", &HispecTrackingCamera::_debug},
+    {"take_stats", &HispecTrackingCamera::_take_stats}
   };
   const std::unordered_map<std::string, std::string>
   HispecTrackingCamera::_exposure_modes = {
@@ -148,21 +151,266 @@ namespace Camera {
    *         frames; non-autofetch keeps the base per-frame expose loop
    */
   long HispecTrackingCamera::expose(const std::string args, std::string &retstring) {
-    if (!this->is_autofetch_mode) {
+    const std::string function("Camera::HispecTrackingCamera::expose");
+    long error = NO_ERROR;
+    if (this->is_freerunning) {
+      if (args=="?" || args=="help") {
+        retstring = CAMERAD_EXPOSE;
+        retstring.append( "\n" );
+        retstring.append( "  Freerun mode: starts a continuous exposure loop in the background\n" );
+        retstring.append( "  and returns immediately. Stop it with \"" + CAMERAD_ABORT + "\".\n" );
+        return HELP;
+      }
+      // Check the camera is ready BEFORE taking the guard, so a failed check
+      // cannot leave the guard set and lock freerun out permanently.
+      if (!this->controller->is_connected) { logwrite(function, "ERROR not connected to controller"); return ERROR; }
+      if (!this->controller->is_powered)   { logwrite(function, "ERROR power is not on"); return ERROR; }
+      if (!this->is_exposuremode_set())    { logwrite(function, "ERROR exposure mode not set"); return ERROR; }
+
+      // The freerun consumer is owned by the hispec exposure modes
+      auto* mode = dynamic_cast<ExposureModeHispecTrackingBase*>(this->exposuremode.get());
+      if (mode == nullptr) {
+        retstring = "ERROR exposure mode does not support freerun";
+        logwrite(function, retstring);
+        return ERROR;
+      }
+
+      // A session that ended on its own -- a producer error, with no abort to
+      // tear it down -- leaves the guard set with no threads running. Reap it
+      // here, otherwise every later start would be refused.
+      if (this->is_freerun_active.load() && !mode->is_freerun_running()) {
+        mode->stop_freerun();                  // joins the finished threads
+        mode->is_freerun.store(false);
+        this->is_freerun_active.store(false);
+        logwrite(function, "reaped a freerun session that had already ended");
+      }
+
+      // Check if freerun is already active
+      if (this->is_freerun_active.exchange(true)) {
+        retstring = "freerun already in progress";
+        logwrite(function, "ERROR "+retstring);
+        return ERROR;
+      }
+
+      //Clear abort state before starting freerun loop
+      this->clear_abortstate();
+      std::string dummy;
+      if (this->set_parameter("abort 0", dummy) != NO_ERROR) {
+        this->is_freerun_active.store(false);  // release the guard
+        retstring = "ERROR resetting Archon abort parameter";
+        logwrite(function, retstring);
+        return ERROR;
+      }
+      if (this->set_parameter("freerun 1", dummy) != NO_ERROR) {
+        this->is_freerun_active.store(false);  // release the guard
+        retstring = "ERROR re-asserting Archon freerun parameter";
+        logwrite(function, retstring);
+        return ERROR;
+      }
+      
+      // Spawn priority and cpu core pinned processing and consumer threads for freerun mode
+      logwrite(function, "freerun mode: starting continuous exposure loop");
+      mode->is_freerun.store(true);
+
+      // Start the freerun loop in a background thread.
+      //
+      // This deliberately does not go through do_expose(), which spawns and
+      // joins a producer and a consumer per call -- per frame, here.
+      // start_freerun() spawns one of each for the whole session and returns
+      // immediately, so no thread is created per frame and nothing is parked.
+      // "abort" ends it: both loops watch the abort state, and abort() joins.
+      if (mode->start_freerun() != NO_ERROR) {
+        mode->is_freerun.store(false);
+        this->is_freerun_active.store(false);  // release the guard
+        retstring = "ERROR starting freerun session";
+        logwrite(function, retstring);
+        return ERROR;
+      }
+
+
+      retstring = "Continuouse exposure loop started in the background. Stop it with \"" + CAMERAD_ABORT + "\".";
+      return NO_ERROR;
+    } else if (this->is_autofetch_mode) {
+      const std::string function("Camera::HispecTrackingCamera::expose");
+      if (!this->controller->is_connected) { logwrite(function, "ERROR not connected to controller"); return ERROR; }
+      if (!this->controller->is_powered)   { logwrite(function, "ERROR power is not on"); return ERROR; }
+      if (!this->is_exposuremode_set())    { logwrite(function, "ERROR exposure mode not set"); return ERROR; }
+      if (auto* m = dynamic_cast<ExposureModeHispecTrackingBase*>(this->exposuremode.get())) {
+        m->set_args({args});
+        // do_expose() joins the producer, so it must not be the endless one
+        m->is_freerun.store(false);
+      }
+      error = this->do_expose();
+      this->end_exposure();   // finalize the datacube, if one is open
+      return error;
+    } else {
       return this->ArchonInterface::expose(args, retstring);
     }
-    const std::string function("Camera::HispecTrackingCamera::expose");
-    if (!this->controller->is_connected) { logwrite(function, "ERROR not connected to controller"); return ERROR; }
-    if (!this->controller->is_powered)   { logwrite(function, "ERROR power is not on"); return ERROR; }
-    if (!this->is_exposuremode_set())    { logwrite(function, "ERROR exposure mode not set"); return ERROR; }
-    if (auto* m = dynamic_cast<ExposureModeHispecTrackingBase*>(this->exposuremode.get())) {
-      m->set_args({args});
-    }
-    long error = this->do_expose();
-    this->end_exposure();
-    return error;
   }
   /***** Camera::HispecTrackingCamera::expose ********************************/
+
+  /***** Camera::HispecTrackingCamera::abort *********************************/
+  /**
+   * @brief      abort, tearing down a freerun session if one is running
+   * @param[in]  args
+   * @param[out] retstring
+   * @return     ERROR|NO_ERROR
+   *
+   */
+  long HispecTrackingCamera::abort(const std::string args, std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::abort");
+
+    // sets the abort state and the Archon abort parameter; both freerun loops
+    // watch the abort state and start winding down here
+    long error = this->ArchonInterface::abort(args, retstring);
+
+    if (auto* m = dynamic_cast<ExposureModeHispecTrackingBase*>(this->exposuremode.get())) {
+      if (this->is_freerun_active.load()) {
+        // blocks only until the in-flight frame read finishes
+        error |= m->stop_freerun();
+        m->is_freerun.store(false);
+        this->is_freerun_active.store(false);  // release the guard
+        // Only safe once both threads are joined: nothing is still dispatching
+        this->end_exposure();
+        logwrite(function, "freerun session stopped");
+      }
+    }
+
+    return error;
+  }
+  /***** Camera::HispecTrackingCamera::abort *********************************/
+
+
+  /***** Camera::HispecTrackingCamera::freerun ********************************/
+  /**
+   * @brief      start the freerun exposure loop
+   * @details    This method starts the freerun exposure loop in the background.
+   * @param[in]  args       arguments for the freerun mode
+   * @param[out] retstring  return string
+   * @return     ERROR|NO_ERROR
+   *
+   */
+  long HispecTrackingCamera::freerun(const std::string &args, std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::freerun");
+    long error = NO_ERROR;
+    // Preps archon and camera-interface for freerun mode
+     if (args.empty()) {
+      retstring = "ERROR: freerun requires an argument";
+      logwrite(function, retstring);
+      return ERROR;
+    }
+    const std::string value = args;
+    std::string param_cmd = "freerun " +  value;  // e.g. "freerun 1" or "freerun 0"
+    std::string dummy;
+    error = this->set_parameter(param_cmd, dummy);
+    this->is_freerunning = (value=="1");
+
+    return error;
+  }
+  /***** Camera::HispecTrackingCamera::freerun ********************************/
+
+  /***** Camera::HispecTrackingCamera::_debug ********************************/
+  /**
+   * @brief      enable or disable per-frame debug logging
+   * @details    Every informational logwrite() in the hispec acquisition and
+   *             processing threads is gated on this, as is timing-statistics
+   *             collection. Logging serializes on a mutex and hits the disk, so
+   *             leaving it on measurably slows acquisition and processing --
+   *             hence off by default. Errors are logged either way.
+   *
+   *             The setting is kept on the instrument and pushed into the
+   *             exposure mode, so it survives an exposure mode change, and it
+   *             can be toggled while an exposure or freerun loop is running.
+   *
+   * @param[in]  args       "true"|"1" to enable, "false"|"0" to disable, empty to query
+   * @param[out] retstring  current state ("true" or "false")
+   * @return     ERROR|NO_ERROR|HELP
+   *
+   */
+  long HispecTrackingCamera::_debug(const std::string &args, std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::_debug");
+
+    if (args=="?" || args=="help") {
+      retstring = "debug [ true | false ]\n";
+      retstring.append( "  Enable or disable per-frame debug logging for the hispec\n" );
+      retstring.append( "  exposure threads. Off by default to avoid blowing up logs,\n" );
+      retstring.append( "  and hindering acquisition and processing. Errors are always\n" );
+      retstring.append( "  logged. With no argument, returns the current state.\n" );
+      return HELP;
+    }
+
+    if (!args.empty()) {
+      std::string state = args;
+      std::transform(state.begin(), state.end(), state.begin(), ::toupper);
+
+      if      (state=="TRUE"  || state=="1") this->is_debug = true;
+      else if (state=="FALSE" || state=="0") this->is_debug = false;
+      else {
+        retstring = "ERROR expected true|false";
+        logwrite(function, retstring);
+        return ERROR;
+      }
+
+      // applies to the running exposure mode immediately
+      if (auto* m = dynamic_cast<ExposureModeHispecTrackingBase*>(this->exposuremode.get())) {
+        m->set_debug(this->is_debug); 
+      }
+      logwrite(function, this->is_debug ? "debug logging enabled" : "debug logging disabled");
+    }
+
+    retstring = (this->is_debug ? "true" : "false");
+    return NO_ERROR;
+  }
+  /***** Camera::HispecTrackingCamera::_debug ********************************/
+
+  /**** Camera::HispecTrackingCamera::_take_stats *************/
+  /**
+   * @brief      enable or disable per-frame timing statistics collection
+   * @details    Every timing measurement in the hispec acquisition and
+   *             processing threads is gated on this, so it can be toggled while
+   *             an exposure or freerun loop is running. Statistics are logged
+   *             at the end of each exposure.
+   *
+   * @param[in]  args       "true"|"1" to enable, "false"|"0" to disable, empty to query
+   * @param[out] retstring  current state ("true" or "false")
+   * @return     ERROR|NO_ERROR|HELP
+   *
+   */
+  long HispecTrackingCamera::_take_stats(const std::string &args, std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::_take_stats");
+
+    if (args=="?" || args=="help") {
+      retstring = "take_stats [ true | false ]\n";
+      retstring.append( "  Enable or disable per-frame timing statistics collection for the hispec\n" );
+      retstring.append( "  exposure threads. Off by default to minimize impact on performance,\n" );
+      retstring.append( "  and hindering acquisition and processing. Errors are always\n" );
+      retstring.append( "  logged. With no argument, returns the current state.\n" );
+      return HELP;
+    }
+
+    if (!args.empty()) {
+      std::string state = args;
+      std::transform(state.begin(), state.end(), state.begin(), ::toupper);
+
+      if      (state=="TRUE"  || state=="1") this->take_stats = true;
+      else if (state=="FALSE" || state=="0") this->take_stats = false;
+      else {
+        retstring = "ERROR expected true|false";
+        logwrite(function, retstring);
+        return ERROR;
+      }
+
+      // applies to the running exposure mode immediately
+      if (auto* m = dynamic_cast<ExposureModeHispecTrackingBase*>(this->exposuremode.get())) {
+        m->set_take_stats(this->take_stats); 
+      }
+      logwrite(function, this->take_stats ? "timing statistics collection enabled" : "timing statistics collection disabled");
+    }
+
+    retstring = (this->take_stats ? "true" : "false");
+    return NO_ERROR;
+  }
+  /**** Camera::HispecTrackingCamera::_take_stats *************/
 
 
   /***** Camera::HispecTrackingCamera::send_inreg ****************************/
@@ -351,7 +599,7 @@ namespace Camera {
       mode.geometry.pixelcount = pixelcount;
     }
     //return retstring and error
-    retstring = "attempted to set exposure mode to " + mode_name;
+    retstring = mode_name;
     return error;
   }
   /***** Camera::HispecTrackingCamera::_exposure_mode ******************************/
@@ -386,7 +634,7 @@ namespace Camera {
       return this->guiding_roi(args, retstring);
     } else if (tokens.size() == 2) {
       return this->roi_exec(args, retstring);
-    } else if (tokens.size() == 1 && upper_args == "ROI FULLFRAME") {
+    } else if (tokens.size() == 1 && upper_args == "FULLFRAME") {
       return this->fullframe(args, retstring);
     } else {
       //query current ROI
@@ -423,6 +671,11 @@ namespace Camera {
     //validate the arguments
     if (this->validate_roi(args, retstring) != NO_ERROR) { return ERROR; }
 
+    // take detector out of window mode: // 0111 000000001100
+    if (this->is_window) {
+      error = this->send_inreg_clocked(this->lvds_module, 1, 28684);
+      this->is_window = false;
+    }   
     //Tokenize the arguments
     std::vector<std::string> tokens;
     Tokenize(args, tokens, " ");
@@ -518,6 +771,9 @@ namespace Camera {
         logwrite(function, "ERROR unable to convert geometry values: " + args);
         return ERROR;
       }
+      // Set detector into window mode: 0111 000000001111 = 28687
+      error = this->send_inreg_clocked(this->lvds_module, 1, 28687);
+      this->is_window = true;
 
       // Set detector registers for each ROI limit
       // vstart: base address 32768
@@ -537,45 +793,45 @@ namespace Camera {
       if (error == NO_ERROR) this->win_hstop = hstop;
 
       // If window mode is active, update geometries to match
-      if (error == NO_ERROR && this->is_window) {
-        const int rows = (this->win_vstop - this->win_vstart) + 1;
-        const int cols = (this->win_hstop - this->win_hstart) + 1;
-        std::string dummy;
+      //if (error == NO_ERROR && this->is_window) {
+      const int rows = (this->win_vstop - this->win_vstart) + 1;
+      const int cols = (this->win_hstop - this->win_hstart) + 1;
+      std::string dummy;
 
-        // Update Archon parameters
-        this->set_parameter("H2RG_columns " + std::to_string(cols), dummy);
-        this->set_parameter("H2RG_rows " + std::to_string(rows), dummy);
-        this->set_parameter("H2RG_rows_skip 0", dummy);
+      // Update Archon parameters
+      this->set_parameter("H2RG_columns " + std::to_string(cols), dummy);
+      this->set_parameter("H2RG_rows " + std::to_string(rows), dummy);
+      this->set_parameter("H2RG_rows_skip 0", dummy);
 
-        // Update CDS geometry via config keys
-        bool changed = false;
-        int pixelcount = cols;
-        auto &mode = this->controller->modemap[this->controller->selectedmode];
-        if (this->cur_exposure_mode == "rxr") {
-          pixelcount = cols * 2;
-        }
-        this->controller->write_config_key("PIXELCOUNT", cols, changed);
-        if (changed) this->controller->send_cmd(APPLYCDS);
-        this->controller->write_config_key("LINECOUNT", rows, changed);
-        if (changed) this->controller->send_cmd(APPLYCDS);
-
-        // Update modemap and camera_info
-        mode.geometry.linecount = rows;
-        mode.geometry.pixelcount = cols;
-        this->camera_info.region_of_interest = {
-          static_cast<uint32_t>(this->win_hstart),
-          static_cast<uint32_t>(this->win_hstop),
-          static_cast<uint32_t>(this->win_vstart),
-          static_cast<uint32_t>(this->win_vstop)
-        };
-        this->camera_info.detector_pixels = {
-          static_cast<uint32_t>(pixelcount * this->taplines_store),
-          static_cast<uint32_t>(rows)
-        };
-
-        // H2RG is 16-bit
-        this->camera_info.set_axes(16);
+      // Update CDS geometry via config keys
+      bool changed = false;
+      int pixelcount = cols;
+      auto &mode = this->controller->modemap[this->controller->selectedmode];
+      if (this->cur_exposure_mode == "rxr") {
+        pixelcount = cols * 2;
       }
+      this->controller->write_config_key("PIXELCOUNT", pixelcount, changed);
+      if (changed) this->controller->send_cmd(APPLYCDS);
+      this->controller->write_config_key("LINECOUNT", rows, changed);
+      if (changed) this->controller->send_cmd(APPLYCDS);
+
+      // Update modemap and camera_info
+      mode.geometry.linecount = rows;
+      mode.geometry.pixelcount = cols;
+      this->camera_info.region_of_interest = {
+        static_cast<uint32_t>(this->win_hstart),
+        static_cast<uint32_t>(this->win_hstop),
+        static_cast<uint32_t>(this->win_vstart),
+        static_cast<uint32_t>(this->win_vstop)
+      };
+      this->camera_info.detector_pixels = {
+        static_cast<uint32_t>(pixelcount * this->taplines_store),
+        static_cast<uint32_t>(rows)
+      };
+
+      // H2RG is 16-bit
+      this->camera_info.set_axes(16);
+      //}
 
       if (error != NO_ERROR) {
         logwrite(function, "ERROR setting window geometry");
@@ -618,6 +874,13 @@ namespace Camera {
     this->set_parameter("H2RG_rows " + std::to_string(rows), dummy);
     this->set_parameter("H2RG_rows_skip " + std::to_string(vstart), dummy);
 
+    // take detector out of window mode: // 0111 000000001100
+    if (this->is_window) {
+      error = this->send_inreg_clocked(this->lvds_module, 1, 28684);
+      this->is_window = false;
+         
+    }   
+
     //Check mode and set cds variables
     // Update CDS geometry via config keys
     bool changed = false;
@@ -644,6 +907,8 @@ namespace Camera {
       static_cast<uint32_t>(this->taplines_store * pixelcount),
       static_cast<uint32_t>(rows)
     };
+
+    error = this->set_camera_mode("FULLFRAME", retstring);
 
     return error;
   }
