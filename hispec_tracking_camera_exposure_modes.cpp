@@ -23,6 +23,14 @@ namespace Camera {
   // Autofetch frame layout: 36-byte ASCII header followed by pixel data
   static constexpr int AUTOFETCH_HEADER_LEN = 36;
 
+  // How often a freerun session reports and resets its timing statistics.
+  // A session has no end, so the sample vectors cannot simply grow.
+  static constexpr size_t STATS_REPORT_FRAMES = 1000;
+
+  // How many fetches in a row may fail before a freerun session gives up. A
+  // single bad frame is survivable; a persistent fault should not spin forever.
+  static constexpr int MAX_CONSECUTIVE_ERRORS = 5;
+
   static size_t block_align(size_t n) {
     return ((n + BLOCK_LEN - 1) / BLOCK_LEN) * BLOCK_LEN;
   }
@@ -107,47 +115,258 @@ namespace Camera {
   /***** Camera::ExposureModeHispecTrackingBase::enqueue *********************/
 
 
-  /***** Camera::ExposureModeHispecTrackingBase::image_processing_thread *****/
+  /***** Camera::ExposureModeHispecTrackingBase::fetch_frame *****************/
   /**
-   * @brief  Consumer thread: pop each queued frame and fan it out to the
-   *         instrument's frame_outputs
+   * @brief  Fetch one frame from an Archon buffer into dest
    */
-  void ExposureModeHispecTrackingBase::image_processing_thread() {
-    const std::string function("Camera::ExposureModeHispecTrackingBase::image_processing_thread");
-    logwrite(function, "enter");
+  long ExposureModeHispecTrackingBase::fetch_frame(int bufindex, unsigned bufblocks,
+                                                   char* dest, size_t dest_bytes) {
+    const std::string function("Camera::ExposureModeHispecTrackingBase::fetch_frame");
+    auto* controller = static_cast<HispecTrackingCamera*>(this->interface)->controller;
 
-    while (!this->interface->is_aborted()) {
+    const size_t needed = static_cast<size_t>(bufblocks) * BLOCK_LEN;
+    if (needed > dest_bytes) {
+      logwrite(function, "ERROR fetch of "+std::to_string(bufblocks)+" blocks needs "+
+               std::to_string(needed)+" bytes, buffer holds "+std::to_string(dest_bytes));
+      return ERROR;
+    }
+
+    const int bufready = bufindex + 1;  // Archon buffers are 1-based
+    if (bufready < 1 || bufready > controller->activebufs) {
+      logwrite(function, "ERROR invalid Archon buffer "+std::to_string(bufready)+
+               ", expected {1:"+std::to_string(controller->activebufs)+"}");
+      return ERROR;
+    }
+
+    if (controller->lock_buffer(bufready) == ERROR) {
+      logwrite(function, "ERROR locking frame buffer "+std::to_string(bufready));
+      return ERROR;
+    }
+    // Every path below this point must unlock, so let scope do it.
+    struct BufferUnlock {
+      ArchonController* controller;
+      ~BufferUnlock() { controller->unlock_buffer(); }
+    } unlock_guard{controller};
+
+    controller->frametype = ArchonController::FRAME_IMAGE;
+
+    // fetch() sets archon_busy and deliberately leaves it set for the reader to
+    // clear; miss that and every later Archon command returns BUSY.
+    if (controller->fetch(controller->frameinfo.bufbase[bufindex], bufblocks) != NO_ERROR) {
+      logwrite(function, "ERROR fetching Archon buffer "+std::to_string(bufready));
+      return ERROR;
+    }
+    struct BusyClear {
+      ArchonController* controller;
+      ~BusyClear() { controller->archon_busy.clear(); }
+    } busy_guard{controller};
+
+    // The Archon streams bufblocks x (4-byte "<XX:" header + BLOCK_LEN bytes).
+    // Read it whole, then verify and compact: one syscall per socket-buffer
+    // rather than four per kilobyte.
+    const size_t wire_bytes = static_cast<size_t>(bufblocks) * (BLOCK_LEN + 4);
+    if (this->fetch_buf.size() < wire_bytes) this->fetch_buf.resize(wire_bytes);
+
+    size_t got = 0;
+    while (got < wire_bytes) {
+      const int n = controller->archon.Read(this->fetch_buf.data()+got, wire_bytes-got);
+      if (n <= 0) {
+        logwrite(function, "ERROR incomplete frame read: "+std::to_string(got)+
+                 " of "+std::to_string(wire_bytes)+" bytes");
+        controller->print_frame_status();
+        return ERROR;
+      }
+      got += static_cast<size_t>(n);
+    }
+
+    char check[5];
+    SNPRINTF(check, "<%02X:", controller->msgref);
+
+    for (unsigned block = 0; block < bufblocks; ++block) {
+      const char* record = this->fetch_buf.data() + static_cast<size_t>(block) * (BLOCK_LEN + 4);
+      if (std::memcmp(record, check, 4) != 0) {
+        if (record[0] == '?') controller->fetchlog();  // Archon has something to say
+        logwrite(function, "ERROR bad block header at block "+std::to_string(block)+
+                 " of "+std::to_string(bufblocks));
+        controller->print_frame_status();
+        return ERROR;
+      }
+      std::memcpy(dest + static_cast<size_t>(block) * BLOCK_LEN, record + 4, BLOCK_LEN);
+    }
+
+    return NO_ERROR;
+  }
+  /***** Camera::ExposureModeHispecTrackingBase::fetch_frame *****************/
+
+
+  /***** Camera::ExposureModeHispecTrackingBase::~ExposureModeHispecTrackingBase */
+  /**
+   * @brief  stop and join the session consumer, if one is still running
+   * @details  A thread left running against a destroyed object is undefined
+   *           behaviour, and set_exposure_mode() can replace this object.
+   */
+  ExposureModeHispecTrackingBase::~ExposureModeHispecTrackingBase() {
+    this->stop_freerun();
+  }
+  /***** Camera::ExposureModeHispecTrackingBase::~ExposureModeHispecTrackingBase */
+
+
+  /***** Camera::ExposureModeHispecTrackingBase::dispatch_one ****************/
+  /**
+   * @brief  Build the metadata for one frame and fan it out to frame_outputs
+   */
+  void ExposureModeHispecTrackingBase::dispatch_one(const std::shared_ptr<ArchonImageBuffer> &buf) {
+    Camera::FrameMetadata meta;
+    meta.frame_number    = buf->bufframen_slice.empty()    ? 0 : static_cast<uint64_t>(buf->bufframen_slice[0]);
+    meta.timestamp       = buf->buftimestamp_slice.empty() ? 0 : buf->buftimestamp_slice[0];
+    meta.width           = buf->width;
+    meta.height          = buf->height;
+    meta.bytes_per_pixel = buf->bytes_per_pixel;
+    const size_t frame_bytes = static_cast<size_t>(buf->width) * buf->height * buf->bytes_per_pixel;
+    this->interface->dispatch_frame(buf->rawpixels.get(), frame_bytes, meta);
+  }
+  /***** Camera::ExposureModeHispecTrackingBase::dispatch_one ****************/
+
+
+  /***** Camera::ExposureModeHispecTrackingBase::process_frames **************/
+  /**
+   * @brief  Consumer loop: pop each queued frame and fan it out
+   * @param[in]  continuous  false = one exposure, true = whole freerun session
+   *
+   * @details  Only the termination condition differs between the two modes, so
+   *           there is one loop rather than two that would drift apart:
+   *
+   *             abort          exit now, dropping whatever is still queued
+   *             stop_consumer  drain the queue first, then exit  (continuous)
+   *             producer done  drain the queue first, then exit  (one-shot)
+   */
+  void ExposureModeHispecTrackingBase::process_frames(bool continuous) {
+    const std::string function("Camera::ExposureModeHispecTrackingBase::process_frames");
+    if (this->is_debug) { logwrite(function, continuous ? "enter (continuous)" : "enter"); }
+
+    // whichever flag ends this loop, in this mode
+    auto finished = [this, continuous] {
+      return continuous ? this->stop_consumer.load() : this->is_producer_finished.load();
+    };
+
+    while (true) {
       std::shared_ptr<ArchonImageBuffer> buf;
       {
         std::unique_lock<std::mutex> lock(this->queue_mutex);
-        this->queue_cv.wait(lock, [this] {
-            return !this->imagebuf_queue.empty() || this->is_producer_finished || this->interface->is_aborted();
+        this->queue_cv.wait(lock, [this, &finished] {
+            return !this->imagebuf_queue.empty() || finished() || this->interface->is_aborted();
             });
-        if (this->interface->is_aborted()) break;
-        if (this->imagebuf_queue.empty()) {
-          if (this->is_producer_finished) {
-            logwrite(function, "queue empty and producer finished");
-            break;
-          }
-          continue;
+
+        if (this->interface->is_aborted()) {
+          if (this->is_debug) { logwrite(function, "aborted"); }
+          break;
         }
-        buf = this->imagebuf_queue.front();
-        this->imagebuf_queue.pop();
+
+        if (!this->imagebuf_queue.empty()) {
+          buf = std::move(this->imagebuf_queue.front());
+          this->imagebuf_queue.pop();
+        }
+        else if (finished()) {
+          if (this->is_debug) { logwrite(function, "queue empty and producer finished"); }
+          break;
+        }
+        else continue;
       }
 
-      Camera::FrameMetadata meta;
-      meta.frame_number    = buf->bufframen_slice.empty()    ? 0 : static_cast<uint64_t>(buf->bufframen_slice[0]);
-      meta.timestamp       = buf->buftimestamp_slice.empty() ? 0 : buf->buftimestamp_slice[0];
-      meta.width           = buf->width;
-      meta.height          = buf->height;
-      meta.bytes_per_pixel = buf->bytes_per_pixel;
-      const size_t frame_bytes = static_cast<size_t>(buf->width) * buf->height * buf->bytes_per_pixel;
-      this->interface->dispatch_frame(buf->rawpixels.get(), frame_bytes, meta);
+      this->dispatch_one(buf);
     }
 
     logwrite(function, "exit");
   }
+  /***** Camera::ExposureModeHispecTrackingBase::process_frames **************/
+
+
   /***** Camera::ExposureModeHispecTrackingBase::image_processing_thread *****/
+  /**
+   * @brief  One-shot consumer, spawned and joined by do_expose()
+   */
+  void ExposureModeHispecTrackingBase::image_processing_thread() {
+    this->process_frames(false);
+  }
+  /***** Camera::ExposureModeHispecTrackingBase::image_processing_thread *****/
+
+
+  /***** Camera::ExposureModeHispecTrackingBase::signal_consumer_stop ********/
+  /**
+   * @brief  Tell the session consumer to drain the queue and exit
+   */
+  void ExposureModeHispecTrackingBase::signal_consumer_stop() {
+    {
+      std::lock_guard<std::mutex> lock(this->queue_mutex);
+      this->is_producer_finished = true;
+      this->stop_consumer.store(true);
+    }
+    this->queue_cv.notify_all();
+  }
+  /***** Camera::ExposureModeHispecTrackingBase::signal_consumer_stop ********/
+
+
+  /***** Camera::ExposureModeHispecTrackingBase::start_freerun ***************/
+  /**
+   * @brief  Start a freerun session and return immediately
+   * @return ERROR|NO_ERROR
+   */
+  long ExposureModeHispecTrackingBase::start_freerun() {
+    const std::string function("Camera::ExposureModeHispecTrackingBase::start_freerun");
+
+    if (this->session_running.load()) {
+      logwrite(function, "ERROR freerun session already running");
+      return ERROR;
+    }
+
+    // reap the previous session's threads, if it ended on its own
+    this->stop_freerun();
+
+    this->is_producer_finished = false;
+    this->is_producer_error    = false;
+    this->is_consumer_error    = false;
+    this->stop_consumer.store(false);
+    this->session_running.store(true);
+
+    // One consumer and one producer for the whole session. Both are members, so
+    // priority and CPU affinity can be applied to either via native_handle().
+    this->consumer_thread = std::thread([this]() { this->process_frames(true); });
+
+    this->producer_thread = std::thread([this]() {
+        this->image_acquisition_thread();   // loops over frames until aborted
+        this->signal_consumer_stop();       // let the consumer drain and exit
+        this->session_running.store(false); // last act: the session is over
+        });
+
+    logwrite(function, "freerun session started");
+
+    return NO_ERROR;
+  }
+  /***** Camera::ExposureModeHispecTrackingBase::start_freerun ***************/
+
+
+  /***** Camera::ExposureModeHispecTrackingBase::stop_freerun ****************/
+  /**
+   * @brief  Stop a freerun session and join both threads
+   * @return ERROR|NO_ERROR
+   */
+  long ExposureModeHispecTrackingBase::stop_freerun() {
+    this->signal_consumer_stop();
+
+    // The producer exits on the abort state, which the caller sets; joining
+    // here waits only for the in-flight frame read to finish.
+    if (this->producer_thread.joinable()) this->producer_thread.join();
+    if (this->consumer_thread.joinable()) this->consumer_thread.join();
+
+    this->session_running.store(false);
+
+    long error = NO_ERROR;
+    error |= (this->is_producer_error ? ERROR : NO_ERROR);
+    error |= (this->is_consumer_error ? ERROR : NO_ERROR);
+
+    return error;
+  }
+  /***** Camera::ExposureModeHispecTrackingBase::stop_freerun ****************/
 
   /***** Camera::ExposureModeHispecTrackingDefault::image_acquisition_thread */
   /**
@@ -185,6 +404,11 @@ namespace Camera {
     const int num_detect = mode->geometry.num_detect;
     const int fallback_bpp = (mode->samplemode == 1) ? 4 : 2;
 
+    // In freerun this call is the whole session: the loop below runs until
+    // aborted and the exposure is triggered once, here, not once per frame.
+    // Read once, so this thread has one fixed behaviour for its whole life.
+    const bool freerun = this->is_freerun.load();
+
     long e = controller->prep_parameter(controller->expose_param, nseq);
     if (e == NO_ERROR) e = controller->load_parameter(controller->expose_param, nseq);
     if (e != NO_ERROR) {
@@ -193,34 +417,51 @@ namespace Camera {
       return;
     }
 
-    int frames_read = 0;
-    for (int i = 0; i < nseq; ++i) {
-      if (this->interface->is_aborted()) break;
+    // 64-bit: in freerun these count for the life of the session, and signed
+    // overflow is undefined behaviour, not a harmless wrap.
+    // Instantiate all variables possible so we don't have to do it in the loop, save time and avoid memory fragmentation.
+    long long frames_read = 0;
+    int consecutive_errors = 0;  //!< reset by every good frame; see MAX_CONSECUTIVE_ERRORS
 
+    for (long long i = 0; freerun || i < nseq; ++i) {
+      if (this->interface->is_aborted()) break;
+      // Timeout comes from READOUT_TIME in the config file (readout_time_msec);
+      // falls back to exptime + margin if that key isn't set.
       if (controller->wait_for_readout() == ERROR) {
         this->is_producer_error = true;
-        break;
+        return;
       }
+      if (this->interface->is_aborted()) break;
 
       const auto idx = controller->frameinfo.index.load();
 
-      // Geometry from the Archon-reported buffer dimensions (BUFnWIDTH/HEIGHT).
-      uint32_t fw   = static_cast<uint32_t>(controller->frameinfo.bufwidth[idx]);
-      uint32_t fh   = static_cast<uint32_t>(controller->frameinfo.bufheight[idx]);
+      // Geometry from the Archon-reported buffer dimensions (BUFnWIDTH/HEIGHT),
+      // read signed so a negative value trips the fallback instead of wrapping
+      // to a huge unsigned and sizing a monstrous fetch.
+      int32_t  sw   = controller->frameinfo.bufwidth[idx];
+      int32_t  sh   = controller->frameinfo.bufheight[idx];
       uint32_t fbpp = (controller->frameinfo.bufsample[idx] == 1) ? 4u : 2u;
-      if (fw == 0 || fh == 0) {
-        fw   = hispec->camera_info.detector_pixels[0];
-        fh   = hispec->camera_info.detector_pixels[1];
+      if (sw <= 0 || sh <= 0) {
+        sw   = static_cast<int32_t>(hispec->camera_info.detector_pixels[0]);
+        sh   = static_cast<int32_t>(hispec->camera_info.detector_pixels[1]);
         fbpp = static_cast<uint32_t>(fallback_bpp);
       }
+      const uint32_t fw = static_cast<uint32_t>(sw);
+      const uint32_t fh = static_cast<uint32_t>(sh);
+
       if (i == 0) {
         logwrite(function, "frame geometry " + std::to_string(fw) + "x" +
                  std::to_string(fh) + " bpp=" + std::to_string(fbpp));
       }
 
-      // Size the buffer to the whole block-aligned frame and read straight into it.
-      const size_t raw    = static_cast<size_t>(fw) * fh * fbpp * num_detect;
-      const size_t nbytes = block_align(raw);
+      // ONE size for this frame. bufblocks is what the Archon will send, and
+      // nbytes is derived from it, so the allocation is by construction exactly
+      // what the fetch delivers. Sizing these separately is what corrupted the
+      // heap: two computations from two snapshots with two fallback rules.
+      const size_t   frame_bytes = static_cast<size_t>(fw) * fh * fbpp * num_detect;
+      const unsigned bufblocks   = static_cast<unsigned>((frame_bytes + BLOCK_LEN - 1) / BLOCK_LEN);
+      const size_t   nbytes      = static_cast<size_t>(bufblocks) * BLOCK_LEN;
+
       auto imagebuffer = std::make_shared<ArchonImageBuffer>();
       try { imagebuffer->rawpixels = std::shared_ptr<char[]>(new char[nbytes]); }
       catch (const std::exception &ex) {
@@ -228,12 +469,20 @@ namespace Camera {
         this->is_producer_error = true;
         break;
       }
-      char* p = imagebuffer->rawpixels.get();
-      if (controller->read_frame(ArchonController::FRAME_IMAGE, p) == ERROR) {
-        logwrite(function, "ERROR reading frame from controller");
-        this->is_producer_error = true;
-        break;
+      // A failed fetch ends a one-shot sequence, but in freerun it is just a
+      // lost frame: one bad block header should not tear down the session.
+      if (this->fetch_frame(idx, bufblocks, imagebuffer->rawpixels.get(), nbytes) != NO_ERROR) {
+        if (!freerun) { this->is_producer_error = true; break; }
+        if (++consecutive_errors > MAX_CONSECUTIVE_ERRORS) {
+          logwrite(function, "ERROR "+std::to_string(consecutive_errors)+
+                   " consecutive fetch failures, ending freerun acquisition");
+          this->is_producer_error = true;
+          break;
+        }
+        continue;
       }
+      consecutive_errors = 0;
+
       imagebuffer->width           = fw;
       imagebuffer->height          = fh;
       imagebuffer->bytes_per_pixel = fbpp;
@@ -243,8 +492,10 @@ namespace Camera {
       ++frames_read;
     }
 
-    logwrite(function, "sequence complete: " + std::to_string(frames_read) +
-             " of " + std::to_string(nseq) + " frames");
+    logwrite(function, freerun
+             ? "freerun acquisition stopped after " + std::to_string(frames_read) + " frames"
+             : "sequence complete: " + std::to_string(frames_read) + " of " +
+               std::to_string(nseq) + " frames");
   }
   /***** Camera::ExposureModeHispecTrackingDefault::image_acquisition_thread */
 
@@ -307,8 +558,14 @@ namespace Camera {
       return;
     }
 
-    int frames_read = 0;
-    for (int i = 0; i < nseq; ++i) {
+    // In freerun this call is the whole session; read once so this thread has
+    // one fixed behaviour for its whole life.
+    const bool freerun = this->is_freerun.load();
+
+    // 64-bit: in freerun these count for the life of the session, and signed
+    // overflow is undefined behaviour, not a harmless wrap.
+    long long frames_read = 0;
+    for (long long i = 0; freerun || i < nseq; ++i) {
       if (this->interface->is_aborted()) break;
 
       if (read_autofetch_frame(hispec, fetch_stats, archon_ts_deltas, prev_archon_ts) != NO_ERROR) {
@@ -340,6 +597,15 @@ namespace Camera {
       imagebuffer->buftimestamp_slice.push_back(controller->frameinfo.buftimestamp[idx]);
       this->enqueue(std::move(imagebuffer));
       ++frames_read;
+
+      // A freerun session has no end, so these sample vectors would grow
+      // without bound. Report and reset them periodically instead.
+      if (freerun && archon_ts_deltas.count() >= STATS_REPORT_FRAMES) {
+        logwrite(function, archon_ts_deltas.summary("archon frame interval"));
+        logwrite(function, fetch_stats.summary("host readout duration"));
+        archon_ts_deltas.clear();
+        fetch_stats.clear();
+      }
     }
 
     if (!archon_ts_deltas.empty()) {
@@ -348,8 +614,10 @@ namespace Camera {
     if (!fetch_stats.empty()) {
       logwrite(function, fetch_stats.summary("host readout duration"));
     }
-    logwrite(function, "sequence complete: " + std::to_string(frames_read) +
-             " of " + std::to_string(nseq) + " frames");
+    logwrite(function, freerun
+             ? "freerun acquisition stopped after " + std::to_string(frames_read) + " frames"
+             : "sequence complete: " + std::to_string(frames_read) + " of " +
+               std::to_string(nseq) + " frames");
   }
   /***** Camera::ExposureModeHispecTrackingAutofetch::image_acquisition_thread */
 

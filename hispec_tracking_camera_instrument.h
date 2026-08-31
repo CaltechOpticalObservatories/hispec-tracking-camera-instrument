@@ -30,6 +30,14 @@ namespace Camera {
       long set_exposure_mode(const std::string &modein, const std::vector<std::string> &modeargs) override;
       long expose(const std::string args, std::string &retstring) override;
 
+      /**
+       * @brief  abort, and tear down a freerun session if one is running
+       * @details  The base abort sets the abort state, which both freerun loops
+       *           watch. This then joins them, so when abort returns the session
+       *           is fully stopped and freerun can be restarted immediately.
+       */
+      long abort(const std::string args, std::string &retstring) override;
+
       std::string default_exposure_mode_name() const override {
         return std::string(HispecTrackingCameraExposureMode::DEFAULT);
       }
@@ -53,6 +61,7 @@ namespace Camera {
 
       long freerun(const std::string &args, std::string &retstring);
       long _debug(const std::string &args, std::string &retstring);
+      long _take_stats(const std::string &args, std::string &retstring);
 
       // Helper to send an INREG command and optionally clock it to the detector
       long send_inreg(int module, int inreg, int value);
@@ -75,6 +84,7 @@ namespace Camera {
       bool is_freerunning{false};
       std::atomic<bool> is_freerun_active{false};  //!< true while the background freerun loop is running
       bool is_debug{false};
+      bool take_stats{false};
   };
 
 }
