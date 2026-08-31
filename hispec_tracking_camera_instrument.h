@@ -7,7 +7,6 @@
 #pragma once
 
 #include "archon_interface.h"
-#include "frame_output_factory.h"
 #include "hispec_tracking_camera_exposure_modes.h"
 
 #include <atomic>
@@ -41,6 +40,10 @@ namespace Camera {
       std::string default_exposure_mode_name() const override {
         return std::string(HispecTrackingCameraExposureMode::DEFAULT);
       }
+
+      bool is_windowed() const { return is_window; }
+      int window_vstart() const { return win_vstart; }
+      int window_hstart() const { return win_hstart; }
 
     private:
       using CmdHandler = long (HispecTrackingCamera::*)(const std::string&, std::string&);

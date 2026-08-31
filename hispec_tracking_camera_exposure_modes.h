@@ -11,11 +11,14 @@
 #include "archon_exposure_modes.h" // ArchonImageBuffer
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
 #include <vector>
+
+namespace Common { class FitsKeys; }
 
 namespace Camera {
 
@@ -84,6 +87,12 @@ namespace Camera {
     protected:
       void enqueue(std::shared_ptr<ArchonImageBuffer> buf);
 
+      // Built once at the start of image_acquisition_thread(), read by the
+      // consumer, so the values cannot shift mid-session.
+      std::shared_ptr<Common::FitsKeys> build_header_set(const std::string &operational_mode,
+                                                         const std::string &subframe_mode,
+                                                         bool is_freerun);
+
       /**
        * @brief  the consumer loop
        * @param[in]  continuous  false: exit when the producer finishes (one exposure)
@@ -95,7 +104,7 @@ namespace Camera {
       void process_frames(bool continuous);
 
       /** @brief  build the metadata for one frame and fan it out to frame_outputs */
-      void dispatch_one(const std::shared_ptr<ArchonImageBuffer> &buf);
+      void dispatch_one(const std::shared_ptr<ArchonImageBuffer> &buf, uint64_t sequence_number);
 
       /**
        * @brief  tell the session consumer to drain the queue and exit
@@ -145,6 +154,7 @@ namespace Camera {
       std::thread consumer_thread;
       std::atomic<bool> stop_consumer{false};   //!< ask the consumer to drain and exit
       std::atomic<bool> session_running{false}; //!< true while the producer is alive
+      std::shared_ptr<const Common::FitsKeys> header_set;
   };
 
   // Default: one frame per readout, read straight into its own buffer.

@@ -78,15 +78,6 @@ namespace Camera {
     this->controller->archon.set_tcp_nodelay(true);
     this->controller->archon.set_recv_buf_size(socket_buf_size);
     this->controller->archon.set_send_buf_size(socket_buf_size);
-
-    Camera::FrameOutputsConfig fo_cfg;
-    fo_cfg.shm_enabled         = true;
-    fo_cfg.shm_segment_name    = "hispec_tracking_camera";
-    fo_cfg.shm_max_frame_bytes = static_cast<size_t>(
-        (this->h2rg_max_pixel + 1) * (this->h2rg_max_pixel + 1) * 4);
-
-    Camera::apply_config_overrides(fo_cfg, this->configfile);
-    this->frame_outputs = Camera::make_frame_outputs(fo_cfg);
   }
   /***** Camera::HispecTrackingCamera::configure_instrument *******************/
 
@@ -249,7 +240,9 @@ namespace Camera {
         // do_expose() joins the producer, so it must not be the endless one
         m->is_freerun.store(false);
       }
-      return this->do_expose();
+      error = this->do_expose();
+      this->end_exposure();   // finalize the datacube, if one is open
+      return error;
     } else {
       return this->ArchonInterface::expose(args, retstring);
     }
@@ -277,6 +270,8 @@ namespace Camera {
         error |= m->stop_freerun();
         m->is_freerun.store(false);
         this->is_freerun_active.store(false);  // release the guard
+        // Only safe once both threads are joined: nothing is still dispatching
+        this->end_exposure();
         logwrite(function, "freerun session stopped");
       }
     }
