@@ -465,6 +465,15 @@ namespace Camera {
   long HispecTrackingCamera::h2rg_init(const std::string &args, std::string &retstring) {
     const std::string function("Camera::HispecTrackingCamera::h2rg_init");
 
+    // Start defaults to 1 in the ACF, so it's already true at load time and
+    // never sees a 0->1 transition on power-up. The H2RG main reset only
+    // fires on that rising edge, so re-trigger it here now that power is on.
+    if (this->controller->set_parameter("Start", 1) != NO_ERROR) {
+      logwrite(function, "ERROR re-triggering Start");
+      retstring = "error";
+      return ERROR;
+    }
+
     // Enable output to Pad B and HIGHOHM: 0100 000000010010 = 16402
     long error = this->send_inreg_clocked(this->lvds_module, 1, 16402);
     if (error != NO_ERROR) {

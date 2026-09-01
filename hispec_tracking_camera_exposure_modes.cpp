@@ -136,6 +136,18 @@ namespace Camera {
         logwrite(function, "ERROR overall timeout reading autofetch frame");
         return ERROR;
       }
+
+      // Drain bytes send_cmd() captured while triggering this frame's
+      // exposure (its reply can share a socket read with the frame data)
+      // before waiting on the socket for more.
+      if (!controller->autofetch_carryover.empty()) {
+        const size_t take = std::min(controller->autofetch_carryover.size(), frame_size - total_read);
+        std::memcpy(buf + total_read, controller->autofetch_carryover.data(), take);
+        controller->autofetch_carryover.erase(0, take);
+        total_read += take;
+        continue;
+      }
+
       if (!controller->archon.is_readable(1000)) {
         logwrite(function, "ERROR timeout waiting for autofetch data");
         return ERROR;
