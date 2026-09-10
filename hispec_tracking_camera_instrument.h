@@ -23,6 +23,8 @@ namespace Camera {
 
       bool is_instrument_command(const std::string &cmd);
 
+      std::vector<std::string> instrument_commands() const override;
+
       void configure_instrument() override;
 
       std::vector<std::string> get_exposure_modes() override;

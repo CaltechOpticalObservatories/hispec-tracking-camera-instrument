@@ -7,6 +7,7 @@
 
 #include "hispec_tracking_camera_instrument.h"
 #include "hispec_tracking_camera_exposure_modes.h"
+#include <algorithm>
 #include <iterator>
 
 namespace Camera {
@@ -39,6 +40,20 @@ namespace Camera {
     return command_handlers_.find(cmd) != command_handlers_.end();
   }
   /***** Camera::HispecTrackingCamera::is_instrument_command ******************/
+
+
+  /***** Camera::HispecTrackingCamera::instrument_commands ********************/
+  /**
+   * @brief  names of every instrument-specific command, sorted
+   */
+  std::vector<std::string> HispecTrackingCamera::instrument_commands() const {
+    std::vector<std::string> names;
+    names.reserve(command_handlers_.size());
+    for (const auto &[name, handler] : command_handlers_) names.push_back(name);
+    std::sort(names.begin(), names.end());   // unordered_map order is unspecified
+    return names;
+  }
+  /***** Camera::HispecTrackingCamera::instrument_commands ********************/
 
 
   /***** Camera::HispecTrackingCamera::instrument_cmd *************************/
