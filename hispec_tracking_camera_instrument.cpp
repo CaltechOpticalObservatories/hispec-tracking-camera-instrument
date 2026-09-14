@@ -24,12 +24,13 @@ namespace Camera {
     {"debug", &HispecTrackingCamera::_debug},
     {"take_stats", &HispecTrackingCamera::_take_stats}
   };
+  // FASTLOADPARAM is case-sensitive, so these must match the ACF exactly
   const std::unordered_map<std::string, std::string>
   HispecTrackingCamera::_exposure_modes = {
-    {"utr_rr", "mode_utr_rr"},
-    {"utr_gr", "mode_utr_gr"},
-    {"rx", "mode_rx"},
-    {"rxr", "mode_rxr"}
+    {"utr_rr", "mode_UTR_RR"},
+    {"utr_gr", "mode_UTR_GR"},
+    {"rx", "mode_RX"},
+    {"rxr", "mode_RXR"}
   };
 
   /***** Camera::HispecTrackingCamera::is_instrument_command ******************/
