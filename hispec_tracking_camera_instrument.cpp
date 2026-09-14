@@ -145,36 +145,75 @@ namespace Camera {
   /***** Camera::HispecTrackingCamera::_autofetch_mode ***********************/
 
 
+  /***** Camera::HispecTrackingCamera::check_expose_ready ********************/
+  /**
+   * @brief      verify the camera can start an exposure
+   * @param[out] retstring  why the camera is not ready, untouched on success
+   * @return     ERROR|NO_ERROR
+   *
+   * @details    Called before any guard is taken or parameter written, so a
+   *             failed check cannot leave state latched behind it.
+   */
+  long HispecTrackingCamera::check_expose_ready(std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::check_expose_ready");
+
+    if      (!this->controller->is_connected) retstring = "not connected to controller";
+    else if (!this->controller->is_powered)   retstring = "power is not on";
+    else if (!this->is_exposuremode_set())    retstring = "exposure mode not set";
+    else return NO_ERROR;
+
+    logwrite(function, "ERROR "+retstring);
+    return ERROR;
+  }
+  /***** Camera::HispecTrackingCamera::check_expose_ready ********************/
+
+
   /***** Camera::HispecTrackingCamera::expose ********************************/
   /**
-   * @brief  Autofetch streams continuously, so run one producer session for all
-   *         frames; non-autofetch keeps the base per-frame expose loop
+   * @brief  run one exposure sequence, or start a freerun session
+   * @param[in]  args       optional frame count for the sequence
+   * @param[out] retstring  return string
+   * @return     ERROR|NO_ERROR|HELP
+   *
+   * @details    Both pipelines read the whole sequence from one trigger: the
+   *             ACF's Expose parameter is a countdown the sequencer decrements
+   *             per frame, and its up-the-ramp sequences arm a reset flag on
+   *             every dispatch, spending the first frame of each on a reset.
    */
   long HispecTrackingCamera::expose(const std::string args, std::string &retstring) {
     const std::string function("Camera::HispecTrackingCamera::expose");
-    long error = NO_ERROR;
-    if (this->is_freerunning) {
-      if (args=="?" || args=="help") {
-        retstring = CAMERAD_EXPOSE;
-        retstring.append( "\n" );
-        retstring.append( "  Freerun mode: starts a continuous exposure loop in the background\n" );
-        retstring.append( "  and returns immediately. Stop it with \"" + CAMERAD_ABORT + "\".\n" );
-        return HELP;
-      }
-      // Check the camera is ready BEFORE taking the guard, so a failed check
-      // cannot leave the guard set and lock freerun out permanently.
-      if (!this->controller->is_connected) { logwrite(function, "ERROR not connected to controller"); return ERROR; }
-      if (!this->controller->is_powered)   { logwrite(function, "ERROR power is not on"); return ERROR; }
-      if (!this->is_exposuremode_set())    { logwrite(function, "ERROR exposure mode not set"); return ERROR; }
 
-      // The freerun consumer is owned by the hispec exposure modes
-      auto* mode = dynamic_cast<ExposureModeHispecTrackingBase*>(this->exposuremode.get());
-      if (mode == nullptr) {
-        retstring = "ERROR exposure mode does not support freerun";
-        logwrite(function, retstring);
+    if (args=="?" || args=="help") {
+      retstring = CAMERAD_EXPOSE;
+      retstring.append( " [ <nseq> ]\n" );
+      if (this->is_freerunning) {
+        retstring.append( "  Freerun mode: starts a continuous exposure loop in the background\n" );
+        retstring.append( "  and returns immediately. <nseq> is ignored.\n" );
+      }
+      else {
+        retstring.append( "  where <nseq> is the number of frames read from one trigger\n" );
+        retstring.append( "  (default=1). An up-the-ramp mode spends its first frame on the\n" );
+        retstring.append( "  reset read, so <nseq> must be at least 2 to yield a ramp.\n" );
+      }
+      retstring.append( "  Stop early with \"" + CAMERAD_ABORT + "\".\n" );
+      return HELP;
+    }
+
+    if (this->check_expose_ready(retstring) != NO_ERROR) return ERROR;
+
+    // The freerun session and the sequence args are both owned by the hispec
+    // exposure modes; a base mode (SINGLE, RAW, ...) knows neither.
+    auto* mode = dynamic_cast<ExposureModeHispecTrackingBase*>(this->exposuremode.get());
+    if (mode == nullptr) {
+      if (this->is_freerunning) {
+        retstring = "exposure mode does not support freerun";
+        logwrite(function, "ERROR "+retstring);
         return ERROR;
       }
+      return this->ArchonInterface::expose(args, retstring);
+    }
 
+    if (this->is_freerunning) {
       // A session that ended on its own -- a producer error, with no abort to
       // tear it down -- leaves the guard set with no threads running. Reap it
       // here, otherwise every later start would be refused.
@@ -195,7 +234,7 @@ namespace Camera {
       //Clear abort state before starting freerun loop
       this->clear_abortstate();
       std::string dummy;
-      if (this->set_parameter("abort 0", dummy) != NO_ERROR) {
+      if (this->set_parameter("Abort 0", dummy) != NO_ERROR) {
         this->is_freerun_active.store(false);  // release the guard
         retstring = "ERROR resetting Archon abort parameter";
         logwrite(function, retstring);
@@ -210,6 +249,7 @@ namespace Camera {
       
       // Spawn priority and cpu core pinned processing and consumer threads for freerun mode
       logwrite(function, "freerun mode: starting continuous exposure loop");
+      mode->set_args({});   // a session runs until aborted, not to a frame count
       mode->is_freerun.store(true);
 
       // Start the freerun loop in a background thread.
@@ -230,22 +270,14 @@ namespace Camera {
 
       retstring = "Continuouse exposure loop started in the background. Stop it with \"" + CAMERAD_ABORT + "\".";
       return NO_ERROR;
-    } else if (this->is_autofetch_mode) {
-      const std::string function("Camera::HispecTrackingCamera::expose");
-      if (!this->controller->is_connected) { logwrite(function, "ERROR not connected to controller"); return ERROR; }
-      if (!this->controller->is_powered)   { logwrite(function, "ERROR power is not on"); return ERROR; }
-      if (!this->is_exposuremode_set())    { logwrite(function, "ERROR exposure mode not set"); return ERROR; }
-      if (auto* m = dynamic_cast<ExposureModeHispecTrackingBase*>(this->exposuremode.get())) {
-        m->set_args({args});
-        // do_expose() joins the producer, so it must not be the endless one
-        m->is_freerun.store(false);
-      }
-      error = this->do_expose();
-      this->end_exposure();   // finalize the datacube, if one is open
-      return error;
-    } else {
-      return this->ArchonInterface::expose(args, retstring);
     }
+
+    mode->set_args({args});
+    mode->is_freerun.store(false);   // do_expose() joins the producer, so it must not be the endless one
+
+    const long error = this->do_expose();
+    this->end_exposure();            // finalize the datacube, if one is open
+    return error;
   }
   /***** Camera::HispecTrackingCamera::expose ********************************/
 

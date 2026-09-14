@@ -100,6 +100,10 @@ namespace Camera {
   // single bad frame is survivable; a persistent fault should not spin forever.
   static constexpr int MAX_CONSECUTIVE_ERRORS = 5;
 
+  // The Archon clamps parameters to 20 bits, and the frame count goes straight
+  // into the ACF's Expose parameter.
+  static constexpr int MAX_SEQUENCE_COUNT = 0xFFFFF;
+
   static size_t block_align(size_t n) {
     return ((n + BLOCK_LEN - 1) / BLOCK_LEN) * BLOCK_LEN;
   }
@@ -196,9 +200,38 @@ namespace Camera {
   /***** Camera::ExposureModeHispecTrackingBase::enqueue *********************/
 
 
+  /***** Camera::ExposureModeHispecTrackingBase::sequence_count **************/
+  /**
+   * @brief  Resolve how many frames this exposure should read
+   */
+  std::optional<int> ExposureModeHispecTrackingBase::sequence_count() {
+    const std::string function("Camera::ExposureModeHispecTrackingBase::sequence_count");
+
+    const std::string args = this->get_args_string();
+    if (args.empty()) return 1;
+
+    int count = 0;
+    try { count = std::stoi(args); }
+    catch (const std::exception &) {
+      logwrite(function, "ERROR sequence count is not a number:" + args);
+      return std::nullopt;
+    }
+
+    if (count < 1 || count > MAX_SEQUENCE_COUNT) {
+      logwrite(function, "ERROR sequence count " + std::to_string(count) +
+               " outside {1:" + std::to_string(MAX_SEQUENCE_COUNT) + "}");
+      return std::nullopt;
+    }
+
+    return count;
+  }
+  /***** Camera::ExposureModeHispecTrackingBase::sequence_count **************/
+
+
   /***** Camera::ExposureModeHispecTrackingBase::build_header_set ************/
   std::shared_ptr<Common::FitsKeys> ExposureModeHispecTrackingBase::build_header_set(
-      const std::string &operational_mode, const std::string &subframe_mode, bool is_freerun) {
+      const std::string &operational_mode, const std::string &subframe_mode, bool is_freerun,
+      int n_reads) {
     auto* hispec = static_cast<HispecTrackingCamera*>(this->interface);
     auto* controller = hispec->controller;
     auto keys = std::make_shared<Common::FitsKeys>();
@@ -209,6 +242,8 @@ namespace Camera {
     set_dict_value(*keys, "operational_mode", operational_mode);
     set_dict_value(*keys, "subframe_mode", subframe_mode);
     set_dict_value(*keys, "FREERUN", is_freerun ? "TRUE" : "FALSE");
+    // A freerun session has no fixed length; its per-frame READNUM counts instead
+    if (!is_freerun) set_dict_value(*keys, "n_reads", std::to_string(n_reads));
     set_dict_value(*keys, "file_type", "");
     set_dict_value(*keys, "bitpix", std::to_string(hispec->camera_info.bitpix));
     set_dict_value(*keys, "ref_channel_position", "");
@@ -363,14 +398,15 @@ namespace Camera {
     meta.sequence_number = sequence_number;
     meta.header_set      = this->header_set;
 
-    // No multi-read exposure mode exists yet (see FITS-HEADERS-AND-CUBE-PLAN.md D2.1);
-    // one queued buffer is one whole exposure, so these are per-exposure, not summed.
+    // sequence_number counts from 0 within this exposure, so reads are 1-based
+    const uint64_t read_number = sequence_number + 1;
+
     auto frame_keys = std::make_shared<Common::FitsKeys>();
     set_dict_value(*frame_keys, "mjd_start", precise(mjd_now()));
     set_dict_value(*frame_keys, "acq_time", get_timestamp());
     set_dict_value(*frame_keys, "exposure_time",
                    precise(hispec->camera_info.exposure_time->get()));
-    set_dict_value(*frame_keys, "n_reads", "1");
+    set_dict_value(*frame_keys, "read_number", std::to_string(read_number));
     meta.frame_keys = std::move(frame_keys);
 
     const size_t frame_bytes = static_cast<size_t>(buf->width) * buf->height * buf->bytes_per_pixel;
@@ -545,19 +581,15 @@ namespace Camera {
     // Read once so this thread has one fixed behaviour for its whole life
     const bool freerun = this->is_freerun.load();
 
-    this->header_set = build_header_set(HispecTrackingCameraExposureMode::DEFAULT,
-                                         subframe_mode_for(hispec), freerun);
-
-    int nseq = 1;
-    const std::string args = this->get_args_string();
-    if (!args.empty()) {
-      try { nseq = std::stoi(args); }
-      catch (const std::exception &e) {
-        logwrite(function, "ERROR invalid sequence count: " + args);
-        this->is_producer_error = true;
-        return;
-      }
+    const auto requested = this->sequence_count();
+    if (!requested) {
+      this->is_producer_error = true;
+      return;
     }
+    const int nseq = *requested;
+
+    this->header_set = build_header_set(HispecTrackingCameraExposureMode::DEFAULT,
+                                         subframe_mode_for(hispec), freerun, nseq);
 
     auto* mode = &controller->modemap[controller->selectedmode];
     const int num_detect = mode->geometry.num_detect;
@@ -576,6 +608,7 @@ namespace Camera {
     // Instantiate all variables possible so we don't have to do it in the loop, save time and avoid memory fragmentation.
     long long frames_read = 0;
     int consecutive_errors = 0;  //!< reset by every good frame; see MAX_CONSECUTIVE_ERRORS
+    int previous_frame = 0;      //!< Archon frame number of the last frame fetched
 
     for (long long i = 0; freerun || i < nseq; ++i) {
       if (this->interface->is_aborted()) break;
@@ -637,10 +670,20 @@ namespace Camera {
       }
       consecutive_errors = 0;
 
+      // wait_for_readout() rebaselines its reference frame on every call, so a
+      // fetch slower than the detector skips frames without failing. A ramp is
+      // only meaningful across consecutive reads, so name the gap.
+      const int frame_number = controller->frameinfo.bufframen[idx];
+      if (previous_frame != 0 && frame_number != previous_frame + 1) {
+        logwrite(function, "WARNING frame discontinuity: expected " +
+                 std::to_string(previous_frame + 1) + " got " + std::to_string(frame_number));
+      }
+      previous_frame = frame_number;
+
       imagebuffer->width           = fw;
       imagebuffer->height          = fh;
       imagebuffer->bytes_per_pixel = fbpp;
-      imagebuffer->bufframen_slice.push_back(controller->frameinfo.bufframen[idx]);
+      imagebuffer->bufframen_slice.push_back(frame_number);
       imagebuffer->buftimestamp_slice.push_back(controller->frameinfo.buftimestamp[idx]);
       this->enqueue(std::move(imagebuffer));
       ++frames_read;
@@ -673,19 +716,15 @@ namespace Camera {
     // Read once so this thread has one fixed behaviour for its whole life
     const bool freerun = this->is_freerun.load();
 
-    this->header_set = build_header_set(HispecTrackingCameraExposureMode::AUTOFETCH,
-                                         subframe_mode_for(hispec), freerun);
-
-    int nseq = 1;
-    const std::string args = this->get_args_string();
-    if (!args.empty()) {
-      try { nseq = std::stoi(args); }
-      catch (const std::exception &e) {
-        logwrite(function, "ERROR invalid sequence count: " + args);
-        this->is_producer_error = true;
-        return;
-      }
+    const auto requested = this->sequence_count();
+    if (!requested) {
+      this->is_producer_error = true;
+      return;
     }
+    const int nseq = *requested;
+
+    this->header_set = build_header_set(HispecTrackingCameraExposureMode::AUTOFETCH,
+                                         subframe_mode_for(hispec), freerun, nseq);
 
     auto* mode = &controller->modemap[controller->selectedmode];
     const int num_detect = mode->geometry.num_detect;

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <thread>
 #include <vector>
@@ -87,11 +88,22 @@ namespace Camera {
     protected:
       void enqueue(std::shared_ptr<ArchonImageBuffer> buf);
 
+      /**
+       * @brief  resolve how many frames this exposure should read
+       * @return the frame count, or nullopt if the mode args do not parse
+       * @details  The count is written straight into the ACF's Expose
+       *           parameter, which the Archon limits to 20 bits, so an
+       *           out-of-range value is rejected here rather than left to
+       *           throw from prep_parameter mid-exposure.
+       */
+      std::optional<int> sequence_count();
+
       // Built once at the start of image_acquisition_thread(), read by the
       // consumer, so the values cannot shift mid-session.
       std::shared_ptr<Common::FitsKeys> build_header_set(const std::string &operational_mode,
                                                          const std::string &subframe_mode,
-                                                         bool is_freerun);
+                                                         bool is_freerun,
+                                                         int n_reads);
 
       /**
        * @brief  the consumer loop

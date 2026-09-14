@@ -50,6 +50,9 @@ namespace Camera {
       static const std::unordered_map<std::string, CmdHandler> command_handlers_;
       static const std::unordered_map<std::string, std::string> _exposure_modes;
 
+      // Connected, powered, and an exposure mode set: shared by every expose path
+      long check_expose_ready(std::string &retstring);
+
       // H2RG detector commands
       long h2rg_init(const std::string &args, std::string &retstring);
       long _exposure_mode(const std::string &args, std::string &retstring);
