@@ -74,11 +74,9 @@ namespace Camera {
     }
 
     std::string subframe_mode_for(HispecTrackingCamera *hispec) {
-      if (!hispec->is_windowed()) return "fullframe";
-      std::string mode = hispec->controller->selectedmode;
-      std::transform(mode.begin(), mode.end(), mode.begin(),
-                      [](unsigned char c) { return std::toupper(c); });
-      return (mode.find("GUID") != std::string::npos) ? "guiding" : "ROI";
+      if (hispec->is_windowed()) return "guiding";
+      const auto &mode = hispec->controller->modemap[hispec->controller->selectedmode];
+      return (mode.geometry.linecount >= hispec->detector_rows()) ? "fullframe" : "ROI";
     }
 
     // std::to_string(double) truncates to 6 decimals; round-trip full precision instead
