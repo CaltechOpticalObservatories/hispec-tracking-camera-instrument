@@ -179,16 +179,14 @@ namespace Camera {
       }
       // Check the camera is ready BEFORE taking the guard, so a failed check
       // cannot leave the guard set and lock freerun out permanently.
-      if (!this->controller->is_connected) { logwrite(function, "ERROR not connected to controller"); return ERROR; }
-      if (!this->controller->is_powered)   { logwrite(function, "ERROR power is not on"); return ERROR; }
-      if (!this->is_exposuremode_set())    { logwrite(function, "ERROR exposure mode not set"); return ERROR; }
+      if (!this->controller->is_connected) return fail(function, retstring, "not connected to controller");
+      if (!this->controller->is_powered)   return fail(function, retstring, "power is not on");
+      if (!this->is_exposuremode_set())    return fail(function, retstring, "exposure mode not set");
 
       // The freerun consumer is owned by the hispec exposure modes
       auto* mode = dynamic_cast<ExposureModeHispecTrackingBase*>(this->exposuremode.get());
       if (mode == nullptr) {
-        retstring = "ERROR exposure mode does not support freerun";
-        logwrite(function, retstring);
-        return ERROR;
+        return fail(function, retstring, "exposure mode does not support freerun");
       }
 
       // A session that ended on its own -- a producer error, with no abort to
@@ -203,9 +201,7 @@ namespace Camera {
 
       // Check if freerun is already active
       if (this->is_freerun_active.exchange(true)) {
-        retstring = "freerun already in progress";
-        logwrite(function, "ERROR "+retstring);
-        return ERROR;
+        return fail(function, retstring, "freerun already in progress");
       }
 
       //Clear abort state before starting freerun loop
@@ -247,10 +243,9 @@ namespace Camera {
       retstring = "Continuouse exposure loop started in the background. Stop it with \"" + CAMERAD_ABORT + "\".";
       return NO_ERROR;
     } else if (this->is_autofetch_mode) {
-      const std::string function("Camera::HispecTrackingCamera::expose");
-      if (!this->controller->is_connected) { logwrite(function, "ERROR not connected to controller"); return ERROR; }
-      if (!this->controller->is_powered)   { logwrite(function, "ERROR power is not on"); return ERROR; }
-      if (!this->is_exposuremode_set())    { logwrite(function, "ERROR exposure mode not set"); return ERROR; }
+      if (!this->controller->is_connected) return fail(function, retstring, "not connected to controller");
+      if (!this->controller->is_powered)   return fail(function, retstring, "power is not on");
+      if (!this->is_exposuremode_set())    return fail(function, retstring, "exposure mode not set");
       if (auto* m = dynamic_cast<ExposureModeHispecTrackingBase*>(this->exposuremode.get())) {
         m->set_args({args});
         // do_expose() joins the producer, so it must not be the endless one
@@ -485,17 +480,13 @@ namespace Camera {
     // never sees a 0->1 transition on power-up. The H2RG main reset only
     // fires on that rising edge, so re-trigger it here now that power is on.
     if (this->controller->set_parameter("Start", 1) != NO_ERROR) {
-      logwrite(function, "ERROR re-triggering Start");
-      retstring = "error";
-      return ERROR;
+      return fail(function, retstring, "re-triggering Start");
     }
 
     // Enable output to Pad B and HIGHOHM: 0100 000000010010 = 16402
     long error = this->send_inreg_clocked(this->lvds_module, 1, 16402);
     if (error != NO_ERROR) {
-      logwrite(function, "ERROR enabling Pad B output and HIGHOHM");
-      retstring = "error";
-      return ERROR;
+      return fail(function, retstring, "enabling Pad B output and HIGHOHM");
     }
 
     logwrite(function, "H2RG initialized: Pad B output and HIGHOHM enabled");
@@ -532,9 +523,7 @@ namespace Camera {
     // controller->selectedmode to the canonical modemap key.
     long error = this->ArchonInterface::set_camera_mode(args, retstring);
     if (error != NO_ERROR) {
-      logwrite(function, "ERROR setting camera mode to " + args);
-      retstring = "error";
-      return ERROR;
+      return fail(function, retstring, "setting camera mode to "+args);
     }
 
     // Use the canonical key the base class just set so our lookup always matches
@@ -551,18 +540,14 @@ namespace Camera {
       if (error != NO_ERROR) {
         errstr << "ERROR writing config key " << key << "=" << cfg.value
                << " for mode " << this->controller->selectedmode;
-        logwrite(function, errstr.str());
-        retstring = "error";
-        return ERROR;
+        return fail(function, retstring, errstr.str());
       }
     }
 
     // Activate the staged tapline/readout geometry in the CDS core. APPLYCDS
     // reconfigures readout without power-cycling the detector (unlike APPLYALL).
     if (changed && this->controller->send_cmd(APPLYCDS) != NO_ERROR) {
-      logwrite(function, "ERROR applying tapline configuration (APPLYCDS)");
-      retstring = "error";
-      return ERROR;
+      return fail(function, retstring, "applying tapline configuration (APPLYCDS)");
     }
 
     // mode.tapinfo (num_taps, ampname, readoutdir, gain, offset) is already
@@ -590,13 +575,22 @@ namespace Camera {
     std::string param_cmd;
     long error = NO_ERROR;
 
-    // validate the arguments
+    // No argument is a query, not a mode change
+    if (args.empty()) {
+      retstring = this->cur_exposure_mode;
+      return NO_ERROR;
+    }
+
     auto req_param = _exposure_modes.find(args);
     if (req_param == _exposure_modes.end()) {
-      retstring = "Current exposure mode: " + this->cur_exposure_mode;
-      retstring += "\nProvide a valid exposure mode to switch to.";
-      logwrite(function, retstring);
-      return error;
+      std::vector<std::string> valid;
+      valid.reserve(_exposure_modes.size());
+      for (const auto &[name, param] : _exposure_modes) valid.push_back(name);
+      std::sort(valid.begin(), valid.end());
+      std::string expected;
+      for (const auto &name : valid) expected += (expected.empty() ? "" : "|") + name;
+      return fail(function, retstring,
+                  "invalid exposure mode \""+args+"\"; expected one of "+expected);
     }
     const std::string &mode_name = req_param->first;
     const std::string &mode_value = req_param->second;
@@ -661,13 +655,15 @@ namespace Camera {
       return this->roi_exec(args, retstring);
     } else if (tokens.size() == 1 && upper_args == "FULLFRAME") {
       return this->fullframe(args, retstring);
-    } else {
-      //query current ROI
-      retstring = "Current ROI: " + std::to_string(this->win_hstart) + ", " + std::to_string(this->win_vstart) + ", " + std::to_string(this->win_hstop) + ", " + std::to_string(this->win_vstop);
-      retstring += " :: Provide arguments to execute ROI command.";
+    } else if (tokens.empty()) {
+      retstring = std::to_string(this->win_vstart) + " " + std::to_string(this->win_vstop) + " " +
+                  std::to_string(this->win_hstart) + " " + std::to_string(this->win_hstop);
       return NO_ERROR;
     }
-    return error;
+    return fail(function, retstring,
+                "expected no arguments, \"<vstart> <vstop> <hstart> <hstop>\", "
+                "\"<height> <width>\", or \"fullframe\", but got "+
+                std::to_string(tokens.size())+" arguments");
   }
   /***** Camera::HispecTrackingCamera::roi ******************************/
 
@@ -793,8 +789,7 @@ namespace Camera {
         hstart = std::stoi(tokens[2]);
         hstop  = std::stoi(tokens[3]);
       } catch (const std::exception &e) {
-        logwrite(function, "ERROR unable to convert geometry values: " + args);
-        return ERROR;
+        return fail(function, retstring, "unable to convert geometry values: "+args);
       }
       // Set detector into window mode: 0111 000000001111 = 28687
       error = this->send_inreg_clocked(this->lvds_module, 1, 28687);
@@ -859,8 +854,7 @@ namespace Camera {
       //}
 
       if (error != NO_ERROR) {
-        logwrite(function, "ERROR setting window geometry");
-        return ERROR;
+        return fail(function, retstring, "setting window geometry");
       }
     }
 
@@ -1140,9 +1134,7 @@ namespace Camera {
         if (error == NO_ERROR) logwrite(function, "window mode enabled");
       }
       else {
-        logwrite(function, "ERROR unrecognized argument: " + args);
-        retstring = "invalid_argument";
-        return ERROR;
+        return fail(function, retstring, "unrecognized argument: "+args);
       }
     }
 
