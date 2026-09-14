@@ -44,6 +44,7 @@ namespace Camera {
       }
 
       bool is_windowed() const { return is_window; }
+      int detector_rows() const { return h2rg_max_pixel + 1; }
       int window_vstart() const { return win_vstart; }
       int window_hstart() const { return win_hstart; }
 
