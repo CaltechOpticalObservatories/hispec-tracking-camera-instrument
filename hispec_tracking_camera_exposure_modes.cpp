@@ -98,6 +98,10 @@ namespace Camera {
   // single bad frame is survivable; a persistent fault should not spin forever.
   static constexpr int MAX_CONSECUTIVE_ERRORS = 5;
 
+  // Used only when no geometry-derived deadline has been set
+  static constexpr int DEFAULT_FRAME_WAIT_MSEC = 15000;
+  static constexpr int FRAME_POLL_USEC = 1000;
+
   static size_t block_align(size_t n) {
     return ((n + BLOCK_LEN - 1) / BLOCK_LEN) * BLOCK_LEN;
   }
@@ -344,6 +348,60 @@ namespace Camera {
   /***** Camera::ExposureModeHispecTrackingBase::~ExposureModeHispecTrackingBase */
 
 
+  /***** Camera::ExposureModeHispecTrackingBase::wait_for_frame **************/
+  /**
+   * @brief  Wait for a completed Archon frame newer than baseline
+   */
+  long ExposureModeHispecTrackingBase::wait_for_frame(int &baseline, bool first_of_sequence) {
+    const std::string function("Camera::ExposureModeHispecTrackingBase::wait_for_frame");
+    auto* controller = static_cast<HispecTrackingCamera*>(this->interface)->controller;
+
+    int budget_msec = controller->readout_time_msec > 0
+                    ? controller->readout_time_msec : DEFAULT_FRAME_WAIT_MSEC;
+    // The opening frame may have to wait out a frame already in flight from a
+    // previous command before ours even starts
+    if (first_of_sequence) budget_msec *= 2;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(budget_msec);
+
+    while (!this->interface->is_aborted()) {
+      if (controller->get_frame_status() == NO_ERROR) {
+        // Newest buffer the controller has finished writing. Deliberately not
+        // controller->lastframe, which is 0 whenever nothing is complete yet.
+        int newest = 0, index = -1;
+        for (size_t buf=0; buf < controller->frameinfo.bufframen.size(); ++buf) {
+          if (controller->frameinfo.bufcomplete[buf] &&
+              controller->frameinfo.bufframen[buf] > newest) {
+            newest = controller->frameinfo.bufframen[buf];
+            index  = static_cast<int>(buf);
+          }
+        }
+
+        if (newest > baseline && index >= 0) {
+          if (newest > baseline + 1) {
+            logwrite(function, "ERROR missed "+std::to_string(newest-baseline-1)+
+                               " frame(s): expected "+std::to_string(baseline+1)+
+                               " but the controller is at "+std::to_string(newest));
+            return ERROR;
+          }
+          controller->frameinfo.index.store(index);
+          baseline = newest;
+          return NO_ERROR;
+        }
+      }
+
+      if (std::chrono::steady_clock::now() > deadline) {
+        logwrite(function, "ERROR timeout after "+std::to_string(budget_msec)+
+                           " msec waiting for frame "+std::to_string(baseline+1));
+        return ERROR;
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(FRAME_POLL_USEC));
+    }
+
+    logwrite(function, "aborted waiting for frame "+std::to_string(baseline+1));
+    return ERROR;
+  }
+  /***** Camera::ExposureModeHispecTrackingBase::wait_for_frame **************/
   /***** Camera::ExposureModeHispecTrackingBase::dispatch_one ****************/
   /**
    * @brief  Build the metadata for one frame and fan it out to frame_outputs
@@ -546,20 +604,24 @@ namespace Camera {
     this->header_set = build_header_set(HispecTrackingCameraExposureMode::DEFAULT,
                                          subframe_mode_for(hispec), freerun);
 
-    int nseq = 1;
-    const std::string args = this->get_args_string();
-    if (!args.empty()) {
-      try { nseq = std::stoi(args); }
-      catch (const std::exception &e) {
-        logwrite(function, "ERROR invalid sequence count: " + args);
-        this->is_producer_error = true;
-        return;
-      }
-    }
+    const int nseq = this->nseq.load();
 
     auto* mode = &controller->modemap[controller->selectedmode];
     const int num_detect = mode->geometry.num_detect;
     const int fallback_bpp = (mode->samplemode == 1) ? 4 : 2;
+
+    // Newest frame the controller has, taken before the trigger. Taken after it,
+    // a frame the sequencer has already begun looks like one that predates the
+    // request, and the sequence comes up a frame short. The ACF idles by reading
+    // frames out (reset_while_idling), so this can be an idle frame rather than
+    // ours; that costs one stale frame at the head instead of a missing one at
+    // the tail. Never derived from lastframe, which get_frame_status() reports
+    // as 0 whenever no buffer is complete.
+    int baseline = 0;
+    if (controller->get_frame_status() == NO_ERROR) {
+      const auto &bufframen = controller->frameinfo.bufframen;
+      baseline = *std::max_element(bufframen.begin(), bufframen.end());
+    }
 
     long e = controller->prep_parameter(controller->expose_param, nseq);
     if (e == NO_ERROR) e = controller->load_parameter(controller->expose_param, nseq);
@@ -577,9 +639,7 @@ namespace Camera {
 
     for (long long i = 0; freerun || i < nseq; ++i) {
       if (this->interface->is_aborted()) break;
-      // Timeout comes from READOUT_TIME in the config file (readout_time_msec);
-      // falls back to exptime + margin if that key isn't set.
-      if (controller->wait_for_readout() == ERROR) {
+      if (this->wait_for_frame(baseline, i == 0) != NO_ERROR) {
         this->is_producer_error = true;
         return;
       }

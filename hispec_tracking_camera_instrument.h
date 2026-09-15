@@ -69,6 +69,12 @@ namespace Camera {
       long _debug(const std::string &args, std::string &retstring);
       long _take_stats(const std::string &args, std::string &retstring);
 
+      // Acquire a whole sequence from one Archon trigger, see the .cpp for why
+      long run_exposure_sequence(const std::string &args, std::string &retstring);
+
+      // Per-frame readout deadline for the current geometry and exposure time
+      int readout_timeout_msec() const;
+
       // Helper to send an INREG command and optionally clock it to the detector
       long send_inreg(int module, int inreg, int value);
       long send_inreg_clocked(int module, int inreg, int value);
@@ -86,6 +92,10 @@ namespace Camera {
       // Set in configure_instrument()
       int lvds_module{0};
       int h2rg_max_pixel{0};
+
+      // Readout deadline model, from the .cfg since it varies per system
+      double pixel_time_usec{0.0};
+      double readout_margin_msec{0.0};
 
       bool is_freerunning{false};
       std::atomic<bool> is_freerun_active{false};  //!< true while the background freerun loop is running

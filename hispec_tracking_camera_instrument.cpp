@@ -8,9 +8,26 @@
 #include "hispec_tracking_camera_instrument.h"
 #include "hispec_tracking_camera_exposure_modes.h"
 #include <algorithm>
+#include <cmath>
 #include <iterator>
 
 namespace Camera {
+
+  namespace {
+    // Archon parameters are 20 bits, and prep_parameter() throws above this
+    constexpr int ARCHON_PARAM_MAX = 0xFFFFF;
+
+    // Set by the ACF's CDS timing (SHD2=700 ticks of 10ns); measured 7.07 us/pixel
+    constexpr double DEFAULT_PIXEL_TIME_USEC = 7.0;
+
+    // Covers per-row and per-frame overhead the pixel count does not model.
+    // Generous on purpose: an overrun aborts a good acquisition, an oversized
+    // deadline only delays reporting a failure.
+    constexpr double DEFAULT_READOUT_MARGIN_MSEC = 5000.0;
+
+    // Preferred when present, so new firmware carries its own timing
+    constexpr const char* ACF_PIXEL_TIME_KEYS[] = {"TPIX", "TCLOCK"};
+  }
 
   const std::unordered_map<std::string, HispecTrackingCamera::CmdHandler>
   HispecTrackingCamera::command_handlers_ = {
@@ -86,8 +103,29 @@ namespace Camera {
     this->lvds_module = 10;
     this->h2rg_max_pixel = 2047;
 
+    this->pixel_time_usec = DEFAULT_PIXEL_TIME_USEC;
+    this->readout_margin_msec = DEFAULT_READOUT_MARGIN_MSEC;
+
+    for (int row=0; row < this->configfile.n_rows; ++row) {
+      const auto &param = this->configfile.param[row];
+      const auto &arg   = this->configfile.arg[row];
+      try {
+        if      (param=="PIXEL_TIME_USEC")     this->pixel_time_usec     = std::stod(arg);
+        else if (param=="READOUT_MARGIN_MSEC") this->readout_margin_msec = std::stod(arg);
+        else continue;
+      }
+      catch (const std::exception &e) {
+        throw std::runtime_error("parsing "+param+"="+arg+": "+e.what());
+      }
+      if (this->pixel_time_usec <= 0 || this->readout_margin_msec < 0) {
+        throw std::runtime_error(param+"="+arg+" must be positive");
+      }
+    }
+
     logwrite(function, "LVDS module=" + std::to_string(this->lvds_module) +
-                       " H2RG max pixel=" + std::to_string(this->h2rg_max_pixel));
+                       " H2RG max pixel=" + std::to_string(this->h2rg_max_pixel) +
+                       " pixel_time=" + std::to_string(this->pixel_time_usec) + " usec" +
+                       " readout_margin=" + std::to_string(this->readout_margin_msec) + " msec");
 
     // Optimize Archon socket for high-speed streaming
     constexpr int socket_buf_size = 1024 * 1024;  // 1 MB
@@ -255,10 +293,125 @@ namespace Camera {
       this->end_exposure();   // finalize the datacube, if one is open
       return error;
     } else {
-      return this->ArchonInterface::expose(args, retstring);
+      return this->run_exposure_sequence(args, retstring);
     }
   }
   /***** Camera::HispecTrackingCamera::expose ********************************/
+
+
+  /***** Camera::HispecTrackingCamera::readout_timeout_msec ******************/
+  /**
+   * @brief      per-frame readout deadline for the current geometry
+   * @details    exposure time + one pixel_time per pixel per tap, taps being
+   *             parallel. Scaling with geometry is what lets a full frame and a
+   *             small ROI share one setting, where wait_for_readout()'s fixed
+   *             fallback is too short for the former.
+   * @return     deadline in msec, or 0 if no camera mode is selected
+   *
+   */
+  int HispecTrackingCamera::readout_timeout_msec() const {
+    const auto mode = this->controller->modemap.find(this->controller->selectedmode);
+    if (mode == this->controller->modemap.end()) return 0;
+
+    double pixel_time_usec = this->pixel_time_usec;
+    for (const auto* key : ACF_PIXEL_TIME_KEYS) {
+      const auto entry = this->controller->configmap.find(key);
+      if (entry == this->controller->configmap.end()) continue;
+      try {
+        const double acf_value = std::stod(entry->second.value);
+        if (acf_value > 0) { pixel_time_usec = acf_value; break; }
+      }
+      catch (const std::exception &) { }  // unparsable, keep the configured value
+    }
+
+    // Pixels one tap clocks out, which is what sets the readout duration
+    const auto &geometry = mode->second.geometry;
+    const double pixels_per_tap = static_cast<double>(geometry.pixelcount) * geometry.linecount;
+
+    const double readout_msec = pixels_per_tap * pixel_time_usec / 1000.0;
+    const double exposure_msec = this->controller->get_exptime() * 1000.0;
+    const double total_msec = exposure_msec + readout_msec + this->readout_margin_msec;
+
+    return std::max(1, static_cast<int>(std::lround(total_msec)));
+  }
+  /***** Camera::HispecTrackingCamera::readout_timeout_msec ******************/
+
+
+  /***** Camera::HispecTrackingCamera::run_exposure_sequence *****************/
+  /**
+   * @brief      acquire a sequence of frames from a single Archon trigger
+   * @details    The ACF grabs <nseq> frames per Expose=<nseq> and pulses reset
+   *             only on the first of them, so one trigger yields one ramp.
+   *             ArchonInterface::expose() instead sends Expose=1 <nseq> times,
+   *             which re-enters the sequence and resets on every frame, giving
+   *             <nseq> unrelated single reads rather than a ramp.
+   * @param[in]  args       number of frames, default 1
+   * @param[out] retstring  number of frames on success, reason on failure
+   * @return     ERROR | NO_ERROR | HELP
+   *
+   */
+  long HispecTrackingCamera::run_exposure_sequence(const std::string &args, std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::run_exposure_sequence");
+
+    if (args=="?" || args=="help") {
+      retstring = CAMERAD_EXPOSE;
+      retstring.append( " [ <nseq> ]\n" );
+      retstring.append( "  Acquire <nseq> frames (default 1) from a single Archon trigger,\n" );
+      retstring.append( "  resetting the detector only before the first.\n" );
+      return HELP;
+    }
+
+    if (!this->controller->is_connected) return fail(function, retstring, "not connected to controller");
+    if (!this->controller->is_powered)   return fail(function, retstring, "power is not on");
+    if (!this->is_exposuremode_set())    return fail(function, retstring, "exposure mode not set");
+
+    auto* mode = dynamic_cast<ExposureModeHispecTrackingBase*>(this->exposuremode.get());
+    if (mode == nullptr) {
+      return fail(function, retstring, "exposure mode does not support sequences");
+    }
+
+    // Range-checked here rather than in the producer: the producer hands this
+    // to prep_parameter(), which throws when it is out of range, and a throw
+    // leaving a std::thread terminates the process.
+    int nseq = 1;
+    try {
+      if (!args.empty()) nseq = std::stoi(args);
+    }
+    catch (const std::exception &) {
+      return fail(function, retstring, "invalid frame count \""+args+"\"");
+    }
+    if (nseq < 1 || nseq > ARCHON_PARAM_MAX) {
+      return fail(function, retstring, "frame count "+std::to_string(nseq)+
+                  " outside range {1:"+std::to_string(ARCHON_PARAM_MAX)+"}");
+    }
+
+    // The producer exits on the abort state before reading anything, so without
+    // this an exposure following an abort would quietly return no frames
+    this->clear_abortstate();
+
+    // Recomputed per command because roi and mode change the geometry
+    const int timeout_msec = this->readout_timeout_msec();
+    if (timeout_msec > 0) {
+      this->controller->readout_time_msec = timeout_msec;
+      logwrite(function, "readout deadline "+std::to_string(timeout_msec)+" msec per frame");
+    }
+
+    mode->nseq.store(nseq);
+    mode->is_freerun.store(false);  // do_expose() joins the producer, so it must terminate
+
+    const long error = this->do_expose();
+
+    this->end_exposure();           // finalize the datacube, if one is open
+
+    if (error != NO_ERROR) {
+      return fail(function, retstring, "exposure sequence failed, see log for the reason");
+    }
+
+    retstring = std::to_string(nseq);
+
+    return NO_ERROR;
+  }
+  /***** Camera::HispecTrackingCamera::run_exposure_sequence *****************/
 
   /***** Camera::HispecTrackingCamera::abort *********************************/
   /**
