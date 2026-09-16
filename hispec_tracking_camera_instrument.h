@@ -43,6 +43,24 @@ namespace Camera {
         return std::string(HispecTrackingCameraExposureMode::DEFAULT);
       }
 
+      /**
+       * @brief      one-line snapshot of what the camera was doing
+       * @details    Appended to every error log so a failure carries the state
+       *             that produced it, rather than leaving it to be reconstructed
+       *             from surrounding lines that a concurrent command may have
+       *             interleaved.
+       */
+      std::string state_summary() const;
+
+      /**
+       * @brief      log an error with its root cause and the camera state
+       * @param[in]  brief   what failed, in a few words
+       * @param[in]  detail  why it failed, as specifically as the call site knows
+       * @details    For the acquisition threads, which have no caller to answer.
+       */
+      void log_error(const std::string &function, const std::string &brief,
+                     const std::string &detail) const;
+
       bool is_windowed() const { return is_window; }
       int detector_rows() const { return h2rg_max_pixel + 1; }
       int window_vstart() const { return win_vstart; }
@@ -74,6 +92,10 @@ namespace Camera {
 
       // Per-frame readout deadline for the current geometry and exposure time
       int readout_timeout_msec() const;
+
+      // Short reason to the caller, root cause plus state to the log
+      long fail_detailed(const std::string &function, std::string &retstring,
+                         const std::string &brief, const std::string &detail) const;
 
       // Helper to send an INREG command and optionally clock it to the detector
       long send_inreg(int module, int inreg, int value);

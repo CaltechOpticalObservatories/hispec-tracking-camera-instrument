@@ -259,24 +259,32 @@ namespace Camera {
   long ExposureModeHispecTrackingBase::fetch_frame(int bufindex, unsigned bufblocks,
                                                    char* dest, size_t dest_bytes) {
     const std::string function("Camera::ExposureModeHispecTrackingBase::fetch_frame");
-    auto* controller = static_cast<HispecTrackingCamera*>(this->interface)->controller;
+    auto* hispec = static_cast<HispecTrackingCamera*>(this->interface);
+    auto* controller = hispec->controller;
 
     const size_t needed = static_cast<size_t>(bufblocks) * BLOCK_LEN;
     if (needed > dest_bytes) {
-      logwrite(function, "ERROR fetch of "+std::to_string(bufblocks)+" blocks needs "+
-               std::to_string(needed)+" bytes, buffer holds "+std::to_string(dest_bytes));
+      hispec->log_error(function, "frame larger than its buffer",
+                 "the Archon will send "+std::to_string(bufblocks)+" blocks ("+
+                 std::to_string(needed)+" bytes) but the buffer holds "+
+                 std::to_string(dest_bytes)+"; the geometry changed after the buffer "
+                 "was sized");
       return ERROR;
     }
 
     const int bufready = bufindex + 1;  // Archon buffers are 1-based
     if (bufready < 1 || bufready > controller->activebufs) {
-      logwrite(function, "ERROR invalid Archon buffer "+std::to_string(bufready)+
-               ", expected {1:"+std::to_string(controller->activebufs)+"}");
+      hispec->log_error(function, "invalid frame buffer",
+                 "buffer "+std::to_string(bufready)+" is outside {1:"+
+                 std::to_string(controller->activebufs)+"}; frameinfo.index was "+
+                 std::to_string(bufindex));
       return ERROR;
     }
 
     if (controller->lock_buffer(bufready) == ERROR) {
-      logwrite(function, "ERROR locking frame buffer "+std::to_string(bufready));
+      hispec->log_error(function, "buffer lock failed",
+                 "the Archon rejected LOCK"+std::to_string(bufready)+
+                 ", so the frame cannot be read without risking an overwrite");
       return ERROR;
     }
     // Every path below this point must unlock, so let scope do it.
@@ -290,7 +298,9 @@ namespace Camera {
     // fetch() sets archon_busy and deliberately leaves it set for the reader to
     // clear; miss that and every later Archon command returns BUSY.
     if (controller->fetch(controller->frameinfo.bufbase[bufindex], bufblocks) != NO_ERROR) {
-      logwrite(function, "ERROR fetching Archon buffer "+std::to_string(bufready));
+      hispec->log_error(function, "fetch command rejected",
+                 "the Archon refused FETCH for buffer "+std::to_string(bufready)+
+                 " at address "+std::to_string(controller->frameinfo.bufbase[bufindex]));
       return ERROR;
     }
     struct BusyClear {
@@ -308,8 +318,10 @@ namespace Camera {
     while (got < wire_bytes) {
       const int n = controller->archon.Read(this->fetch_buf.data()+got, wire_bytes-got);
       if (n <= 0) {
-        logwrite(function, "ERROR incomplete frame read: "+std::to_string(got)+
-                 " of "+std::to_string(wire_bytes)+" bytes");
+        hispec->log_error(function, "short frame read",
+                   "socket returned "+std::to_string(got)+" of "+
+                   std::to_string(wire_bytes)+" expected bytes for buffer "+
+                   std::to_string(bufready)+"; the connection closed or stalled mid-frame");
         controller->print_frame_status();
         return ERROR;
       }
@@ -323,8 +335,10 @@ namespace Camera {
       const char* record = this->fetch_buf.data() + static_cast<size_t>(block) * (BLOCK_LEN + 4);
       if (std::memcmp(record, check, 4) != 0) {
         if (record[0] == '?') controller->fetchlog();  // Archon has something to say
-        logwrite(function, "ERROR bad block header at block "+std::to_string(block)+
-                 " of "+std::to_string(bufblocks));
+        hispec->log_error(function, "corrupt frame data",
+                   "block "+std::to_string(block)+" of "+std::to_string(bufblocks)+
+                   " did not start with the expected header "+std::string(check)+
+                   "; the data stream is out of sync with the command stream");
         controller->print_frame_status();
         return ERROR;
       }
@@ -354,7 +368,8 @@ namespace Camera {
    */
   long ExposureModeHispecTrackingBase::wait_for_frame(int &baseline, bool first_of_sequence) {
     const std::string function("Camera::ExposureModeHispecTrackingBase::wait_for_frame");
-    auto* controller = static_cast<HispecTrackingCamera*>(this->interface)->controller;
+    auto* hispec = static_cast<HispecTrackingCamera*>(this->interface);
+    auto* controller = hispec->controller;
 
     int budget_msec = controller->readout_time_msec > 0
                     ? controller->readout_time_msec : DEFAULT_FRAME_WAIT_MSEC;
@@ -379,9 +394,11 @@ namespace Camera {
 
         if (newest > baseline && index >= 0) {
           if (newest > baseline + 1) {
-            logwrite(function, "ERROR missed "+std::to_string(newest-baseline-1)+
-                               " frame(s): expected "+std::to_string(baseline+1)+
-                               " but the controller is at "+std::to_string(newest));
+            hispec->log_error(function, "dropped frames",
+                       std::to_string(newest-baseline-1)+" frame(s) were overwritten "
+                       "before the host could fetch them: expected frame "+
+                       std::to_string(baseline+1)+" but the newest complete buffer is "+
+                       std::to_string(newest)+"; the controller is outrunning the fetch");
             return ERROR;
           }
           controller->frameinfo.index.store(index);
@@ -391,8 +408,11 @@ namespace Camera {
       }
 
       if (std::chrono::steady_clock::now() > deadline) {
-        logwrite(function, "ERROR timeout after "+std::to_string(budget_msec)+
-                           " msec waiting for frame "+std::to_string(baseline+1));
+        hispec->log_error(function, "readout timeout",
+                   "no buffer completed frame "+std::to_string(baseline+1)+" within "+
+                   std::to_string(budget_msec)+" msec; either the sequencer is not "
+                   "producing frames for this mode, or the deadline is short for the "
+                   "geometry (raise READOUT_MARGIN_MSEC or PIXEL_TIME_USEC)");
         return ERROR;
       }
       std::this_thread::sleep_for(std::chrono::microseconds(FRAME_POLL_USEC));
@@ -588,12 +608,16 @@ namespace Camera {
     auto* controller = hispec->controller;
 
     if (controller->selectedmode.empty()) {
-      logwrite(function, "ERROR no mode selected");
+      hispec->log_error(function, "no camera mode selected",
+                 "controller->selectedmode is empty, so the frame geometry is unknown; "
+                 "run \"load\" or \"mode <name>\" first");
       this->is_producer_error = true;
       return;
     }
     if (controller->expose_param.empty()) {
-      logwrite(function, "ERROR EXPOSE_PARAM not defined in configuration");
+      hispec->log_error(function, "cannot trigger an exposure",
+                 "EXPOSE_PARAM is absent from the .cfg, so there is no Archon "
+                 "parameter to write the frame count to");
       this->is_producer_error = true;
       return;
     }
@@ -626,7 +650,11 @@ namespace Camera {
     long e = controller->prep_parameter(controller->expose_param, nseq);
     if (e == NO_ERROR) e = controller->load_parameter(controller->expose_param, nseq);
     if (e != NO_ERROR) {
-      logwrite(function, "ERROR failed to initiate exposure");
+      hispec->log_error(function, "exposure trigger rejected",
+                 "the Archon refused FASTPREPPARAM/FASTLOADPARAM "+
+                 controller->expose_param+"="+std::to_string(nseq)+
+                 "; check that this parameter name matches the ACF exactly, it is "
+                 "case sensitive");
       this->is_producer_error = true;
       return;
     }
@@ -635,6 +663,7 @@ namespace Camera {
     // overflow is undefined behaviour, not a harmless wrap.
     // Instantiate all variables possible so we don't have to do it in the loop, save time and avoid memory fragmentation.
     long long frames_read = 0;
+    this->frames_acquired.store(0);
     int consecutive_errors = 0;  //!< reset by every good frame; see MAX_CONSECUTIVE_ERRORS
 
     for (long long i = 0; freerun || i < nseq; ++i) {
@@ -677,7 +706,9 @@ namespace Camera {
       auto imagebuffer = std::make_shared<ArchonImageBuffer>();
       try { imagebuffer->rawpixels = std::shared_ptr<char[]>(new char[nbytes]); }
       catch (const std::exception &ex) {
-        logwrite(function, "ERROR allocating image buffer: " + std::string(ex.what()));
+        hispec->log_error(function, "out of memory",
+                   "could not allocate "+std::to_string(nbytes)+" bytes for frame "+
+                   std::to_string(i+1)+" of "+std::to_string(nseq)+": "+ex.what());
         this->is_producer_error = true;
         break;
       }
@@ -686,8 +717,10 @@ namespace Camera {
       if (this->fetch_frame(idx, bufblocks, imagebuffer->rawpixels.get(), nbytes) != NO_ERROR) {
         if (!freerun) { this->is_producer_error = true; break; }
         if (++consecutive_errors > MAX_CONSECUTIVE_ERRORS) {
-          logwrite(function, "ERROR "+std::to_string(consecutive_errors)+
-                   " consecutive fetch failures, ending freerun acquisition");
+          hispec->log_error(function, "freerun ended",
+                     std::to_string(consecutive_errors)+" consecutive fetch failures "
+                     "exceeded the limit of "+std::to_string(MAX_CONSECUTIVE_ERRORS)+
+                     "; the preceding fetch_frame errors give the cause");
           this->is_producer_error = true;
           break;
         }
@@ -702,6 +735,7 @@ namespace Camera {
       imagebuffer->buftimestamp_slice.push_back(controller->frameinfo.buftimestamp[idx]);
       this->enqueue(std::move(imagebuffer));
       ++frames_read;
+      this->frames_acquired.store(frames_read);
     }
 
     logwrite(function, freerun
