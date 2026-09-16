@@ -85,6 +85,32 @@ namespace Camera {
       oss << std::setprecision(15) << value;
       return oss.str();
     }
+
+    // Single source for pixel time, so PIXTIME and FRAMETME cannot drift apart
+    double pixel_time_usec() {
+      const auto *entry = find_header_entry("pixel_time");
+      if (!entry) return 0.0;
+      try { return std::stod(header_default(*entry, THIS_CAMERA)); }
+      catch (const std::exception &) { return 0.0; }
+    }
+
+    // One amplifier region is every pixel of one tap, at pixel time
+    std::string frame_time_for(const ArchonController::geometry_t &geometry) {
+      constexpr double USEC_PER_SEC = 1.0e6;
+      const double pixel_time = pixel_time_usec();
+      if (pixel_time <= 0.0 || geometry.linecount <= 0 || geometry.pixelcount <= 0) return "";
+      const double pixels_per_tap = static_cast<double>(geometry.linecount) * geometry.pixelcount;
+      return precise(pixel_time * pixels_per_tap / USEC_PER_SEC);
+    }
+
+    // Which tapline the reference amp reads out changes with the mode
+    std::string refpix_channel_for(const ArchonController::modeinfo_t &mode,
+                                   const std::string &refpix_amp) {
+      for (int tap = 0; tap < mode.tapinfo.num_taps; ++tap) {
+        if (mode.tapinfo.ampname[tap] == refpix_amp) return std::to_string(tap + 1);
+      }
+      return "";
+    }
   }
 
   // Autofetch frame layout: 36-byte ASCII header followed by pixel data
@@ -210,9 +236,8 @@ namespace Camera {
     set_dict_value(*keys, "file_type", "");
     set_dict_value(*keys, "bitpix", std::to_string(hispec->camera_info.bitpix));
     set_dict_value(*keys, "ref_channel_position", "");
-    set_dict_value(*keys, "refpix_channel", "");
-    set_dict_value(*keys, "clock_rate", "");
     set_dict_value(*keys, "pixel_time", "");
+    set_dict_value(*keys, "FIRMWARE", controller->firmware);
 
     if (hispec->is_windowed()) {
       set_dict_value(*keys, "nskip_rows", std::to_string(hispec->window_vstart()));
@@ -223,13 +248,15 @@ namespace Camera {
     }
 
     if (!controller->selectedmode.empty()) {
-      auto &mode = controller->modemap[controller->selectedmode];
+      const auto &mode = controller->modemap[controller->selectedmode];
       if (auto it = mode.acfkeys.keydb.find("READOUTMODE"); it != mode.acfkeys.keydb.end())
         set_dict_value(*keys, "read_mode", it->second.keyvalue);
-      if (mode.geometry.num_detect > 0)
-        set_dict_value(*keys, "n_channels", std::to_string(mode.geometry.num_detect));
-      else
-        set_dict_value(*keys, "n_channels", "");
+
+      // The reference channel is not a detector channel, so it is not counted
+      const int num_taps = mode.tapinfo.num_taps;
+      set_dict_value(*keys, "n_channels", num_taps > 1 ? std::to_string(num_taps - 1) : "");
+      set_dict_value(*keys, "refpix_channel", refpix_channel_for(mode, hispec->reference_amp()));
+      set_dict_value(*keys, "frame_time", frame_time_for(mode.geometry));
     }
 
     // Bias voltages: MOD10/LVLC_Vn in the ACF's global [CONFIG] section
@@ -368,6 +395,7 @@ namespace Camera {
     set_dict_value(*frame_keys, "acq_time", get_timestamp());
     set_dict_value(*frame_keys, "exposure_time",
                    precise(hispec->camera_info.exposure_time->get()));
+    set_dict_value(*frame_keys, "exposure_time_unit", "");
     set_dict_value(*frame_keys, "n_reads", "1");
     meta.frame_keys = std::move(frame_keys);
 

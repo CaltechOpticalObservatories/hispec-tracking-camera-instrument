@@ -48,7 +48,12 @@ namespace Camera {
       int window_vstart() const { return win_vstart; }
       int window_hstart() const { return win_hstart; }
 
+      const std::string& reference_amp() const { return refpix_amp; }
+
     private:
+      // The reference channel's tapline moves with the mode, its amp does not
+      static constexpr const char* DEFAULT_REFPIX_AMP = "AM52";
+
       using CmdHandler = long (HispecTrackingCamera::*)(const std::string&, std::string&);
       static const std::unordered_map<std::string, CmdHandler> command_handlers_;
       static const std::unordered_map<std::string, std::string> _exposure_modes;
@@ -86,6 +91,7 @@ namespace Camera {
       // Set in configure_instrument()
       int lvds_module{0};
       int h2rg_max_pixel{0};
+      std::string refpix_amp{DEFAULT_REFPIX_AMP};
 
       bool is_freerunning{false};
       std::atomic<bool> is_freerun_active{false};  //!< true while the background freerun loop is running

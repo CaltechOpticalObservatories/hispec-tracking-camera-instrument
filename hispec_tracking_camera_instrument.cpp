@@ -86,8 +86,15 @@ namespace Camera {
     this->lvds_module = 10;
     this->h2rg_max_pixel = 2047;
 
+    for (int row=0; row < this->configfile.n_rows; row++) {
+      if (this->configfile.param[row]=="REFPIX_AMP" && !this->configfile.arg[row].empty()) {
+        this->refpix_amp = this->configfile.arg[row];
+      }
+    }
+
     logwrite(function, "LVDS module=" + std::to_string(this->lvds_module) +
-                       " H2RG max pixel=" + std::to_string(this->h2rg_max_pixel));
+                       " H2RG max pixel=" + std::to_string(this->h2rg_max_pixel) +
+                       " reference channel amp=" + this->refpix_amp);
 
     // Optimize Archon socket for high-speed streaming
     constexpr int socket_buf_size = 1024 * 1024;  // 1 MB
