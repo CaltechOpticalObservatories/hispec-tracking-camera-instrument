@@ -84,6 +84,15 @@ namespace Camera {
       std::atomic<bool> is_freerun{false};  //!< true: producer loops continuously
       std::atomic<bool> take_stats{false};  //!< true to collect timing statistics
 
+      // Frames to acquire from one Archon trigger. Range-checked by the caller,
+      // since the producer hands it to prep_parameter(), which throws when it is
+      // out of range, and a throw leaving a thread terminates the process.
+      std::atomic<int> nseq{1};
+
+      // Frames the producer actually queued, so a failure can report how far
+      // the sequence got rather than only that it stopped
+      std::atomic<long long> frames_acquired{0};
+
     protected:
       void enqueue(std::shared_ptr<ArchonImageBuffer> buf);
 
@@ -139,6 +148,24 @@ namespace Camera {
        *             single failed fetch should not tear down the session.
        */
       long fetch_frame(int bufindex, unsigned bufblocks, char* dest, size_t dest_bytes);
+
+      /**
+       * @brief      wait for the Archon to complete a frame newer than baseline
+       * @param[in,out] baseline  newest frame seen before this one; updated on success
+       * @param[in]  first_of_sequence  true for the opening frame, which allows
+       *             twice the budget: a frame already in flight when the sequence
+       *             is triggered has to finish before ours begins
+       * @return     ERROR|NO_ERROR
+       *
+       * @details    Replaces ArchonController::wait_for_readout(), which derives
+       *             its own baseline from lastframe. get_frame_status() sets
+       *             lastframe to 0 whenever no buffer is flagged complete, which
+       *             is exactly the state a freshly loaded controller is in, so
+       *             the first frame of the first exposure reads as a thousand
+       *             missed ones. Tracking the baseline across the sequence
+       *             instead means it is never derived from a completeness flag.
+       */
+      long wait_for_frame(int &baseline, bool first_of_sequence);
 
       std::queue<std::shared_ptr<ArchonImageBuffer>> imagebuf_queue;
 
