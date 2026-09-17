@@ -8,9 +8,30 @@
 #include "hispec_tracking_camera_instrument.h"
 #include "hispec_tracking_camera_exposure_modes.h"
 #include <algorithm>
+#include <cmath>
+#include <iomanip>
 #include <iterator>
 
 namespace Camera {
+
+  namespace {
+    // Archon parameters are 20 bits, and prep_parameter() throws above this
+    constexpr int ARCHON_PARAM_MAX = 0xFFFFF;
+
+    // Set by the ACF's CDS timing (SHD2=700 ticks of 10ns); measured 7.07 us/pixel
+    constexpr double DEFAULT_PIXEL_TIME_USEC = 7.0;
+
+    // Covers per-row and per-frame overhead the pixel count does not model.
+    // Generous on purpose: an overrun aborts a good acquisition, an oversized
+    // deadline only delays reporting a failure.
+    constexpr double DEFAULT_READOUT_MARGIN_MSEC = 5000.0;
+
+    // Preferred when present, so new firmware carries its own timing
+    constexpr const char* ACF_PIXEL_TIME_KEYS[] = {"TPIX", "TCLOCK"};
+
+    constexpr double USEC_PER_SEC = 1.0e6;
+    constexpr double MSEC_PER_SEC = 1.0e3;
+  }
 
   const std::unordered_map<std::string, HispecTrackingCamera::CmdHandler>
   HispecTrackingCamera::command_handlers_ = {
@@ -74,6 +95,65 @@ namespace Camera {
   /***** Camera::HispecTrackingCamera::instrument_cmd *************************/
 
 
+  /***** Camera::HispecTrackingCamera::state_summary *************************/
+  /**
+   * @brief  Snapshot of controller and geometry state, for error logs
+   */
+  std::string HispecTrackingCamera::state_summary() const {
+    std::ostringstream oss;
+    oss << "[connected=" << (this->controller->is_connected ? "y" : "n")
+        << " powered="   << (this->controller->is_powered ? "y" : "n")
+        << " firmware="  << (this->controller->is_firmwareloaded ? "y" : "n")
+        << " mode="      << (this->controller->selectedmode.empty()
+                             ? "none" : this->controller->selectedmode)
+        << " readout="   << (this->cur_exposure_mode.empty()
+                             ? "none" : this->cur_exposure_mode);
+
+    const auto mode = this->controller->modemap.find(this->controller->selectedmode);
+    if (mode != this->controller->modemap.end()) {
+      const auto &geometry = mode->second.geometry;
+      oss << " geometry=" << geometry.pixelcount << "x" << geometry.linecount
+          << " taps="     << geometry.amps[0] << "x" << geometry.amps[1];
+    }
+
+    oss << " window="  << (this->is_window ? "y" : "n")
+        << " exptime=" << std::fixed << std::setprecision(3) << this->controller->get_exptime()
+        << " lastframe=" << this->controller->lastframe
+        << " deadline=" << this->controller->readout_time_msec << "ms]";
+    return oss.str();
+  }
+  /***** Camera::HispecTrackingCamera::state_summary *************************/
+
+
+  /***** Camera::HispecTrackingCamera::log_error *****************************/
+  /**
+   * @brief  Log what failed, why, and what the camera was doing
+   */
+  void HispecTrackingCamera::log_error(const std::string &function,
+                                       const std::string &brief,
+                                       const std::string &detail) const {
+    std::string message = "ERROR " + brief;
+    if (!detail.empty()) message += ": " + detail;
+    logwrite(function, message + " " + this->state_summary());
+  }
+  /***** Camera::HispecTrackingCamera::log_error *****************************/
+
+
+  /***** Camera::HispecTrackingCamera::fail_detailed *************************/
+  /**
+   * @brief  Hand the caller the short reason, give the log the root cause
+   */
+  long HispecTrackingCamera::fail_detailed(const std::string &function,
+                                           std::string &retstring,
+                                           const std::string &brief,
+                                           const std::string &detail) const {
+    this->log_error(function, brief, detail);
+    retstring = brief;
+    return ERROR;
+  }
+  /***** Camera::HispecTrackingCamera::fail_detailed *************************/
+
+
   /***** Camera::HispecTrackingCamera::configure_instrument *******************/
   /**
    * @brief      extract+apply instrument-specific parameters from config file
@@ -86,14 +166,33 @@ namespace Camera {
     this->lvds_module = 10;
     this->h2rg_max_pixel = 2047;
 
-    for (int row=0; row < this->configfile.n_rows; row++) {
-      if (this->configfile.param[row]=="REFPIX_AMP" && !this->configfile.arg[row].empty()) {
-        this->refpix_amp = this->configfile.arg[row];
+    this->pixel_time_usec = DEFAULT_PIXEL_TIME_USEC;
+    this->readout_margin_msec = DEFAULT_READOUT_MARGIN_MSEC;
+
+    for (int row=0; row < this->configfile.n_rows; ++row) {
+      const auto &param = this->configfile.param[row];
+      const auto &arg   = this->configfile.arg[row];
+      if (param=="REFPIX_AMP" && !arg.empty()) {
+        this->refpix_amp = arg;
+        continue;
+      }
+      try {
+        if      (param=="PIXEL_TIME_USEC")     this->pixel_time_usec     = std::stod(arg);
+        else if (param=="READOUT_MARGIN_MSEC") this->readout_margin_msec = std::stod(arg);
+        else continue;
+      }
+      catch (const std::exception &e) {
+        throw std::runtime_error("parsing "+param+"="+arg+": "+e.what());
+      }
+      if (this->pixel_time_usec <= 0 || this->readout_margin_msec < 0) {
+        throw std::runtime_error(param+"="+arg+" must be positive");
       }
     }
 
     logwrite(function, "LVDS module=" + std::to_string(this->lvds_module) +
                        " H2RG max pixel=" + std::to_string(this->h2rg_max_pixel) +
+                       " pixel_time=" + std::to_string(this->pixel_time_usec) + " usec" +
+                       " readout_margin=" + std::to_string(this->readout_margin_msec) + " msec" +
                        " reference channel amp=" + this->refpix_amp);
 
     // Optimize Archon socket for high-speed streaming
@@ -186,14 +285,25 @@ namespace Camera {
       }
       // Check the camera is ready BEFORE taking the guard, so a failed check
       // cannot leave the guard set and lock freerun out permanently.
-      if (!this->controller->is_connected) return fail(function, retstring, "not connected to controller");
-      if (!this->controller->is_powered)   return fail(function, retstring, "power is not on");
-      if (!this->is_exposuremode_set())    return fail(function, retstring, "exposure mode not set");
+      if (!this->controller->is_connected) {
+        return this->fail_detailed(function, retstring, "not connected",
+                   "no socket is open to the Archon; run \"open\" first");
+      }
+      if (!this->controller->is_powered) {
+        return this->fail_detailed(function, retstring, "power is off",
+                   "Archon reports power state \""+this->controller->power_status+"\"");
+      }
+      if (!this->is_exposuremode_set()) {
+        return this->fail_detailed(function, retstring, "exposure mode not set",
+                   "no acquisition pipeline is selected");
+      }
 
       // The freerun consumer is owned by the hispec exposure modes
       auto* mode = dynamic_cast<ExposureModeHispecTrackingBase*>(this->exposuremode.get());
       if (mode == nullptr) {
-        return fail(function, retstring, "exposure mode does not support freerun");
+        return this->fail_detailed(function, retstring, "wrong exposure mode",
+                   "\""+this->exposuremode->get_type()+"\" is a base Archon pipeline "
+                   "and has no freerun loop");
       }
 
       // A session that ended on its own -- a producer error, with no abort to
@@ -208,7 +318,8 @@ namespace Camera {
 
       // Check if freerun is already active
       if (this->is_freerun_active.exchange(true)) {
-        return fail(function, retstring, "freerun already in progress");
+        return this->fail_detailed(function, retstring, "freerun already running",
+                   "a session is already active; run \"abort\" before starting another");
       }
 
       //Clear abort state before starting freerun loop
@@ -216,15 +327,15 @@ namespace Camera {
       std::string dummy;
       if (this->set_parameter("abort 0", dummy) != NO_ERROR) {
         this->is_freerun_active.store(false);  // release the guard
-        retstring = "ERROR resetting Archon abort parameter";
-        logwrite(function, retstring);
-        return ERROR;
+        return this->fail_detailed(function, retstring, "cannot clear abort",
+                   "the Archon rejected \"abort 0\"; ABORT_PARAM in the .cfg must "
+                   "match the ACF parameter name exactly, it is case sensitive");
       }
       if (this->set_parameter("freerun 1", dummy) != NO_ERROR) {
         this->is_freerun_active.store(false);  // release the guard
-        retstring = "ERROR re-asserting Archon freerun parameter";
-        logwrite(function, retstring);
-        return ERROR;
+        return this->fail_detailed(function, retstring, "cannot set freerun",
+                   "the Archon rejected \"freerun 1\"; check that freerun exists "
+                   "in the loaded ACF");
       }
       
       // Spawn priority and cpu core pinned processing and consumer threads for freerun mode
@@ -241,18 +352,26 @@ namespace Camera {
       if (mode->start_freerun() != NO_ERROR) {
         mode->is_freerun.store(false);
         this->is_freerun_active.store(false);  // release the guard
-        retstring = "ERROR starting freerun session";
-        logwrite(function, retstring);
-        return ERROR;
+        return this->fail_detailed(function, retstring, "freerun did not start",
+                   "the producer and consumer threads could not be spawned");
       }
 
 
       retstring = "Continuouse exposure loop started in the background. Stop it with \"" + CAMERAD_ABORT + "\".";
       return NO_ERROR;
     } else if (this->is_autofetch_mode) {
-      if (!this->controller->is_connected) return fail(function, retstring, "not connected to controller");
-      if (!this->controller->is_powered)   return fail(function, retstring, "power is not on");
-      if (!this->is_exposuremode_set())    return fail(function, retstring, "exposure mode not set");
+      if (!this->controller->is_connected) {
+        return this->fail_detailed(function, retstring, "not connected",
+                   "no socket is open to the Archon; run \"open\" first");
+      }
+      if (!this->controller->is_powered) {
+        return this->fail_detailed(function, retstring, "power is off",
+                   "Archon reports power state \""+this->controller->power_status+"\"");
+      }
+      if (!this->is_exposuremode_set()) {
+        return this->fail_detailed(function, retstring, "exposure mode not set",
+                   "no acquisition pipeline is selected");
+      }
       if (auto* m = dynamic_cast<ExposureModeHispecTrackingBase*>(this->exposuremode.get())) {
         m->set_args({args});
         // do_expose() joins the producer, so it must not be the endless one
@@ -262,10 +381,176 @@ namespace Camera {
       this->end_exposure();   // finalize the datacube, if one is open
       return error;
     } else {
-      return this->ArchonInterface::expose(args, retstring);
+      return this->run_exposure_sequence(args, retstring);
     }
   }
   /***** Camera::HispecTrackingCamera::expose ********************************/
+
+
+  /***** Camera::HispecTrackingCamera::readout_timeout_msec ******************/
+  /**
+   * @brief      per-frame readout deadline for the current geometry
+   * @details    exposure time + one pixel_time per pixel per tap, taps being
+   *             parallel. Scaling with geometry is what lets a full frame and a
+   *             small ROI share one setting, where wait_for_readout()'s fixed
+   *             fallback is too short for the former.
+   * @return     deadline in msec, or 0 if no camera mode is selected
+   *
+   */
+  int HispecTrackingCamera::readout_timeout_msec() const {
+    const double readout_msec = this->frame_readout_sec() * MSEC_PER_SEC;
+    if (readout_msec <= 0.0) return 0;   // no camera mode selected
+
+    const double exposure_msec = this->controller->get_exptime() * MSEC_PER_SEC;
+    const double total_msec = exposure_msec + readout_msec + this->readout_margin_msec;
+
+    return std::max(1, static_cast<int>(std::lround(total_msec)));
+  }
+  /***** Camera::HispecTrackingCamera::readout_timeout_msec ******************/
+
+
+  /***** Camera::HispecTrackingCamera::effective_pixel_time_usec *************/
+  /**
+   * @brief      pixel time in force, preferring the ACF's own value
+   * @details    New firmware carrying its own timing wins over PIXEL_TIME_USEC
+   *             from the config file.
+   * @return     microseconds per pixel
+   *
+   */
+  double HispecTrackingCamera::effective_pixel_time_usec() const {
+    for (const auto* key : ACF_PIXEL_TIME_KEYS) {
+      const auto entry = this->controller->configmap.find(key);
+      if (entry == this->controller->configmap.end()) continue;
+      try {
+        const double acf_value = std::stod(entry->second.value);
+        if (acf_value > 0) return acf_value;
+      }
+      catch (const std::exception &) { }  // unparsable, keep the configured value
+    }
+    return this->pixel_time_usec;
+  }
+  /***** Camera::HispecTrackingCamera::effective_pixel_time_usec *************/
+
+
+  /***** Camera::HispecTrackingCamera::frame_readout_sec *********************/
+  /**
+   * @brief      time to clock out one amplifier region in the selected mode
+   * @details    The readout deadline and the FRAMETME keyword are the same
+   *             quantity, so both come from here and cannot disagree.
+   * @return     seconds, or 0 if no camera mode is selected
+   *
+   */
+  double HispecTrackingCamera::frame_readout_sec() const {
+    const auto mode = this->controller->modemap.find(this->controller->selectedmode);
+    if (mode == this->controller->modemap.end()) return 0.0;
+
+    // Pixels one tap clocks out, which is what sets the readout duration
+    const auto &geometry = mode->second.geometry;
+    if (geometry.pixelcount <= 0 || geometry.linecount <= 0) return 0.0;
+    const double pixels_per_tap = static_cast<double>(geometry.pixelcount) * geometry.linecount;
+
+    return pixels_per_tap * this->effective_pixel_time_usec() / USEC_PER_SEC;
+  }
+  /***** Camera::HispecTrackingCamera::frame_readout_sec *********************/
+
+
+  /***** Camera::HispecTrackingCamera::run_exposure_sequence *****************/
+  /**
+   * @brief      acquire a sequence of frames from a single Archon trigger
+   * @details    The ACF grabs <nseq> frames per Expose=<nseq> and pulses reset
+   *             only on the first of them, so one trigger yields one ramp.
+   *             ArchonInterface::expose() instead sends Expose=1 <nseq> times,
+   *             which re-enters the sequence and resets on every frame, giving
+   *             <nseq> unrelated single reads rather than a ramp.
+   * @param[in]  args       number of frames, default 1
+   * @param[out] retstring  number of frames on success, reason on failure
+   * @return     ERROR | NO_ERROR | HELP
+   *
+   */
+  long HispecTrackingCamera::run_exposure_sequence(const std::string &args, std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::run_exposure_sequence");
+
+    if (args=="?" || args=="help") {
+      retstring = CAMERAD_EXPOSE;
+      retstring.append( " [ <nseq> ]\n" );
+      retstring.append( "  Acquire <nseq> frames (default 1) from a single Archon trigger,\n" );
+      retstring.append( "  resetting the detector only before the first.\n" );
+      return HELP;
+    }
+
+    if (!this->controller->is_connected) {
+      return this->fail_detailed(function, retstring, "not connected",
+                 "no socket is open to the Archon; run \"open\" first");
+    }
+    if (!this->controller->is_powered) {
+      return this->fail_detailed(function, retstring, "power is off",
+                 "Archon reports power state \""+this->controller->power_status+
+                 "\"; run \"power on\" first");
+    }
+    if (!this->is_exposuremode_set()) {
+      return this->fail_detailed(function, retstring, "exposure mode not set",
+                 "no acquisition pipeline is selected; \"load\" or \"mode\" "
+                 "normally selects one");
+    }
+
+    auto* mode = dynamic_cast<ExposureModeHispecTrackingBase*>(this->exposuremode.get());
+    if (mode == nullptr) {
+      return this->fail_detailed(function, retstring, "wrong exposure mode",
+                 "\""+this->exposuremode->get_type()+"\" is a base Archon pipeline "
+                 "with no sequence support; select a hispec mode");
+    }
+
+    // Range-checked here rather than in the producer: the producer hands this
+    // to prep_parameter(), which throws when it is out of range, and a throw
+    // leaving a std::thread terminates the process.
+    int nseq = 1;
+    try {
+      if (!args.empty()) nseq = std::stoi(args);
+    }
+    catch (const std::exception &) {
+      return this->fail_detailed(function, retstring, "invalid frame count",
+                 "\""+args+"\" is not an integer");
+    }
+    if (nseq < 1 || nseq > ARCHON_PARAM_MAX) {
+      return this->fail_detailed(function, retstring, "frame count out of range",
+                 std::to_string(nseq)+" is outside {1:"+std::to_string(ARCHON_PARAM_MAX)+
+                 "}; the Archon Expose parameter is 20 bits");
+    }
+
+    // The producer exits on the abort state before reading anything, so without
+    // this an exposure following an abort would quietly return no frames
+    this->clear_abortstate();
+
+    // Recomputed per command because roi and mode change the geometry
+    const int timeout_msec = this->readout_timeout_msec();
+    if (timeout_msec > 0) {
+      this->controller->readout_time_msec = timeout_msec;
+      logwrite(function, "readout deadline "+std::to_string(timeout_msec)+" msec per frame");
+    }
+
+    mode->nseq.store(nseq);
+    mode->is_freerun.store(false);  // do_expose() joins the producer, so it must terminate
+
+    const long error = this->do_expose();
+
+    this->end_exposure();           // finalize the datacube, if one is open
+
+    if (error != NO_ERROR) {
+      const long long got = mode->frames_acquired.load();
+      std::string cause = "the acquisition thread stopped";
+      if (mode->is_consumer_error) cause = "the processing thread stopped";
+      else if (!mode->is_producer_error) cause = "neither thread flagged an error, so the stage is unknown";
+      return this->fail_detailed(function, retstring, "exposure failed",
+                                 cause+" after acquiring "+std::to_string(got)+" of "+
+                                 std::to_string(nseq)+" frame(s); the preceding log line "
+                                 "gives the failing step");
+    }
+
+    retstring = std::to_string(nseq);
+
+    return NO_ERROR;
+  }
+  /***** Camera::HispecTrackingCamera::run_exposure_sequence *****************/
 
   /***** Camera::HispecTrackingCamera::abort *********************************/
   /**
@@ -313,9 +598,8 @@ namespace Camera {
     long error = NO_ERROR;
     // Preps archon and camera-interface for freerun mode
      if (args.empty()) {
-      retstring = "ERROR: freerun requires an argument";
-      logwrite(function, retstring);
-      return ERROR;
+      return this->fail_detailed(function, retstring, "missing argument",
+                 "freerun expects 1 to arm continuous exposure or 0 to disarm it");
     }
     const std::string value = args;
     std::string param_cmd = "freerun " +  value;  // e.g. "freerun 1" or "freerun 0"
@@ -487,13 +771,17 @@ namespace Camera {
     // never sees a 0->1 transition on power-up. The H2RG main reset only
     // fires on that rising edge, so re-trigger it here now that power is on.
     if (this->controller->set_parameter("Start", 1) != NO_ERROR) {
-      return fail(function, retstring, "re-triggering Start");
+      return this->fail_detailed(function, retstring, "H2RG init failed",
+                 "could not set the Archon Start parameter, which the H2RG main "
+                 "reset needs as a 0 to 1 edge; check that Start exists in the ACF");
     }
 
     // Enable output to Pad B and HIGHOHM: 0100 000000010010 = 16402
     long error = this->send_inreg_clocked(this->lvds_module, 1, 16402);
     if (error != NO_ERROR) {
-      return fail(function, retstring, "enabling Pad B output and HIGHOHM");
+      return this->fail_detailed(function, retstring, "H2RG init failed",
+                 "INREG write of 16402 (Pad B output + HIGHOHM) to LVDS module "+
+                 std::to_string(this->lvds_module)+" was not acknowledged");
     }
 
     logwrite(function, "H2RG initialized: Pad B output and HIGHOHM enabled");
@@ -530,7 +818,9 @@ namespace Camera {
     // controller->selectedmode to the canonical modemap key.
     long error = this->ArchonInterface::set_camera_mode(args, retstring);
     if (error != NO_ERROR) {
-      return fail(function, retstring, "setting camera mode to "+args);
+      return this->fail_detailed(function, retstring, "camera mode not set",
+                 "\""+args+"\" was rejected; it must name a [MODE_*] section of the "
+                 "loaded ACF and firmware must already be loaded");
     }
 
     // Use the canonical key the base class just set so our lookup always matches
@@ -547,21 +837,44 @@ namespace Camera {
       if (error != NO_ERROR) {
         errstr << "ERROR writing config key " << key << "=" << cfg.value
                << " for mode " << this->controller->selectedmode;
-        return fail(function, retstring, errstr.str());
+        return this->fail_detailed(function, retstring, "camera mode not set",
+                   "staging config key "+key+"="+cfg.value+" for mode "+
+                   this->controller->selectedmode+" was rejected by the controller");
       }
     }
 
     // Activate the staged tapline/readout geometry in the CDS core. APPLYCDS
     // reconfigures readout without power-cycling the detector (unlike APPLYALL).
     if (changed && this->controller->send_cmd(APPLYCDS) != NO_ERROR) {
-      return fail(function, retstring, "applying tapline configuration (APPLYCDS)");
+      return this->fail_detailed(function, retstring, "camera mode not set",
+                 "APPLYCDS failed after staging the tapline configuration for "+
+                 this->controller->selectedmode);
+    }
+
+    // The ACF's [MODE_*] sections hold config keys only, so selecting a mode
+    // moves the CDS geometry while the detector keeps clocking the previous
+    // window. Push the H2RG side to match, otherwise the frame never completes
+    // and the readout times out. Any mode whose geometry differs from the ACF
+    // defaults (ROI, GUIDING, FAST_GUIDING) is unusable without this.
+    const int rows = mode.geometry.linecount;
+    const int columns = mode.geometry.pixelcount;
+    std::string dummy;
+    if (this->set_parameter("H2RG_rows "+std::to_string(rows), dummy)       != NO_ERROR ||
+        this->set_parameter("H2RG_columns "+std::to_string(columns), dummy) != NO_ERROR ||
+        this->set_parameter("H2RG_rows_skip 0", dummy)                      != NO_ERROR) {
+      return this->fail_detailed(function, retstring, "camera mode not set",
+                 "the controller rejected the H2RG geometry for "+
+                 this->controller->selectedmode+" ("+std::to_string(columns)+"x"+
+                 std::to_string(rows)+"); check H2RG_rows, H2RG_columns and "
+                 "H2RG_rows_skip exist in the ACF");
     }
 
     // mode.tapinfo (num_taps, ampname, readoutdir, gain, offset) is already
     // populated for every mode at ACF-load time (ArchonController::parse_tapinfo),
     // so it is available here via modemap[selectedmode] without re-parsing.
 
-    logwrite(function, "Camera mode set to " + this->controller->selectedmode);
+    logwrite(function, "Camera mode set to " + this->controller->selectedmode +
+                       " (" + std::to_string(columns) + "x" + std::to_string(rows) + " per tap)");
     retstring = "done";
     return NO_ERROR;
   }
@@ -596,8 +909,9 @@ namespace Camera {
       std::sort(valid.begin(), valid.end());
       std::string expected;
       for (const auto &name : valid) expected += (expected.empty() ? "" : "|") + name;
-      return fail(function, retstring,
-                  "invalid exposure mode \""+args+"\"; expected one of "+expected);
+      return this->fail_detailed(function, retstring, "invalid exposure mode",
+                 "\""+args+"\" is not a readout mode; expected one of "+expected+
+                 ", which map to the mode_* parameters in the ACF");
     }
     const std::string &mode_name = req_param->first;
     const std::string &mode_value = req_param->second;
@@ -667,10 +981,11 @@ namespace Camera {
                   std::to_string(this->win_hstart) + " " + std::to_string(this->win_hstop);
       return NO_ERROR;
     }
-    return fail(function, retstring,
-                "expected no arguments, \"<vstart> <vstop> <hstart> <hstop>\", "
-                "\"<height> <width>\", or \"fullframe\", but got "+
-                std::to_string(tokens.size())+" arguments");
+    return this->fail_detailed(function, retstring, "invalid ROI arguments",
+               "got "+std::to_string(tokens.size())+" argument(s) \""+args+
+               "\"; expected none to query, \"<height> <width>\" for a centred ROI, "
+               "\"<vstart> <vstop> <hstart> <hstop>\" for an explicit one, "
+               "or \"fullframe\"");
   }
   /***** Camera::HispecTrackingCamera::roi ******************************/
 
@@ -796,7 +1111,9 @@ namespace Camera {
         hstart = std::stoi(tokens[2]);
         hstop  = std::stoi(tokens[3]);
       } catch (const std::exception &e) {
-        return fail(function, retstring, "unable to convert geometry values: "+args);
+        return this->fail_detailed(function, retstring, "invalid ROI",
+                   "could not parse \""+args+"\" as four integers "
+                   "<vstart> <vstop> <hstart> <hstop>");
       }
       // Set detector into window mode: 0111 000000001111 = 28687
       error = this->send_inreg_clocked(this->lvds_module, 1, 28687);
@@ -861,7 +1178,10 @@ namespace Camera {
       //}
 
       if (error != NO_ERROR) {
-        return fail(function, retstring, "setting window geometry");
+        return this->fail_detailed(function, retstring, "ROI not set",
+                   "one or more INREG writes to LVDS module "+
+                   std::to_string(this->lvds_module)+" failed while setting "
+                   "vstart/vstop/hstart/hstop");
       }
     }
 
@@ -957,10 +1277,9 @@ namespace Camera {
     int vstart, vstop, hstart, hstop, height, width;
     Tokenize(args, tokens, " ");
     if (tokens.size() != 4 && tokens.size() != 2) {
-        message.str(""); message << "param expected 4 or 2 arguments (vstart, vstop, hstart, hstop) || (Height and Width) but got " << tokens.size();
-        retstring = message.str();
-        logwrite(function, message.str() );
-        return ERROR;
+        return this->fail_detailed(function, retstring, "wrong ROI argument count",
+                   "got "+std::to_string(tokens.size())+", expected 2 (<height> <width>) "
+                   "or 4 (<vstart> <vstop> <hstart> <hstop>)");
     }
     if (tokens.size() == 2) {
       // Check if the two arguments are valid height and width
@@ -968,21 +1287,16 @@ namespace Camera {
           height = std::stoi(tokens[0]);
           width = std::stoi(tokens[1]);
           if (height <= 0 || width <= 0) {
-              message.str(""); message << "Height and width must be positive integers";
-              retstring = message.str();
-              logwrite(function, message.str());
-              return ERROR;
+              return this->fail_detailed(function, retstring, "ROI must be positive",
+                         "height="+tokens[0]+" width="+tokens[1]+"; both must exceed 0");
           } else if (height > 2048 || width > 1024) {
-              message.str(""); message << "Height and width must be within the detector range";
-              retstring = message.str();
-              logwrite(function, message.str());
-              return ERROR;
+              return this->fail_detailed(function, retstring, "ROI exceeds the detector",
+                         "height="+tokens[0]+" width="+tokens[1]+
+                         "; limits are height<=2048 and width<=1024");
           }
       } catch (std::invalid_argument &) {
-          message.str(""); message << "Height and width must be valid integers";
-          retstring = message.str();
-          logwrite(function, message.str());
-          return ERROR;
+          return this->fail_detailed(function, retstring, "ROI not numeric",
+                     "could not parse \""+args+"\" as <height> <width>");
       }
     } else {
       // Check if the four arguments are valid vstart, vstop, hstart, hstop
@@ -992,24 +1306,18 @@ namespace Camera {
           hstart = std::stoi(tokens[2]);
           hstop = std::stoi(tokens[3]);
       } catch (std::invalid_argument &) {
-          message.str(""); message << "vstart, vstop, hstart, hstop must be valid integers";
-          retstring = message.str();
-          logwrite(function, message.str());
-          return ERROR;
+          return this->fail_detailed(function, retstring, "ROI not numeric",
+                     "could not parse \""+args+"\" as four integers");
       }
       // Validate values are within detector
       if ( vstart < 0 || vstop > 2047 || hstart < 0 || hstop > 2047) {
-          message.str(""); message << "geometry values " << args << " outside pixel range";
-          retstring = message.str();
-          logwrite( function, message.str());
-          return ERROR;
+          return this->fail_detailed(function, retstring, "ROI outside the detector",
+                     "\""+args+"\" must satisfy 0<=vstart, vstop<=2047, 0<=hstart, hstop<=2047");
       }
       // Validate values have proper ordering
       if (vstart >= vstop || hstart >= hstop) {
-          message.str(""); message << "geometry values " << args << " are not correctly ordered";
-          retstring = message.str();
-          logwrite( function, message.str());
-          return ERROR;
+          return this->fail_detailed(function, retstring, "ROI bounds out of order",
+                     "\""+args+"\" must satisfy vstart<vstop and hstart<hstop");
       }
     }
     retstring = message.str();
@@ -1141,7 +1449,8 @@ namespace Camera {
         if (error == NO_ERROR) logwrite(function, "window mode enabled");
       }
       else {
-        return fail(function, retstring, "unrecognized argument: "+args);
+        return this->fail_detailed(function, retstring, "invalid argument",
+                   "window_mode expects true|1|false|0 but got \""+args+"\"");
       }
     }
 

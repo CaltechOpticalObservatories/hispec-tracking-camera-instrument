@@ -43,12 +43,36 @@ namespace Camera {
         return std::string(HispecTrackingCameraExposureMode::DEFAULT);
       }
 
+      /**
+       * @brief      one-line snapshot of what the camera was doing
+       * @details    Appended to every error log so a failure carries the state
+       *             that produced it, rather than leaving it to be reconstructed
+       *             from surrounding lines that a concurrent command may have
+       *             interleaved.
+       */
+      std::string state_summary() const;
+
+      /**
+       * @brief      log an error with its root cause and the camera state
+       * @param[in]  brief   what failed, in a few words
+       * @param[in]  detail  why it failed, as specifically as the call site knows
+       * @details    For the acquisition threads, which have no caller to answer.
+       */
+      void log_error(const std::string &function, const std::string &brief,
+                     const std::string &detail) const;
+
       bool is_windowed() const { return is_window; }
       int detector_rows() const { return h2rg_max_pixel + 1; }
       int window_vstart() const { return win_vstart; }
       int window_hstart() const { return win_hstart; }
 
       const std::string& reference_amp() const { return refpix_amp; }
+
+      /** @brief  pixel time in force, from the ACF when it carries one */
+      double effective_pixel_time_usec() const;
+
+      /** @brief  seconds to clock out one amplifier region in the selected mode */
+      double frame_readout_sec() const;
 
     private:
       // The reference channel's tapline moves with the mode, its amp does not
@@ -74,6 +98,16 @@ namespace Camera {
       long _debug(const std::string &args, std::string &retstring);
       long _take_stats(const std::string &args, std::string &retstring);
 
+      // Acquire a whole sequence from one Archon trigger, see the .cpp for why
+      long run_exposure_sequence(const std::string &args, std::string &retstring);
+
+      // Per-frame readout deadline for the current geometry and exposure time
+      int readout_timeout_msec() const;
+
+      // Short reason to the caller, root cause plus state to the log
+      long fail_detailed(const std::string &function, std::string &retstring,
+                         const std::string &brief, const std::string &detail) const;
+
       // Helper to send an INREG command and optionally clock it to the detector
       long send_inreg(int module, int inreg, int value);
       long send_inreg_clocked(int module, int inreg, int value);
@@ -92,6 +126,10 @@ namespace Camera {
       int lvds_module{0};
       int h2rg_max_pixel{0};
       std::string refpix_amp{DEFAULT_REFPIX_AMP};
+
+      // Readout deadline model, from the .cfg since it varies per system
+      double pixel_time_usec{0.0};
+      double readout_margin_msec{0.0};
 
       bool is_freerunning{false};
       std::atomic<bool> is_freerun_active{false};  //!< true while the background freerun loop is running

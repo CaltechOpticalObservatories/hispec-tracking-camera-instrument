@@ -33,8 +33,10 @@ namespace Camera {
         Type::String, "sec", "sec", {} },
       { "bitpix", "DETBITS", "Detector bit depth, needed for offset correction",
         Type::Integer, "16", "16", {} },
+      // No default: the live value comes from PIXEL_TIME_USEC or the ACF, and a
+      // second number here would be the drift this keyword is meant to record
       { "pixel_time", "PIXTIME", "[us] Pixel time spent reading out each pixel",
-        Type::Number, "5.92", "", {} },
+        Type::Number, "", "", {} },
       { "frame_time", "FRAMETME", "[sec] Time to read out each amplifier region",
         Type::Number, "", "", {} },
       { "n_channels", "NCHANLS", "Number of detector channels",
