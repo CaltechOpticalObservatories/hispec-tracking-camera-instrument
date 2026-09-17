@@ -28,6 +28,12 @@ namespace Camera {
 
     // Preferred when present, so new firmware carries its own timing
     constexpr const char* ACF_PIXEL_TIME_KEYS[] = {"TPIX", "TCLOCK"};
+
+    /// Clears a flag however its scope exits
+    struct ScopedFlag {
+      std::atomic<bool> &flag;
+      ~ScopedFlag() { flag.store(false); }
+    };
   }
 
   const std::unordered_map<std::string, HispecTrackingCamera::CmdHandler>
@@ -479,6 +485,16 @@ namespace Camera {
                  std::to_string(nseq)+" is outside {1:"+std::to_string(ARCHON_PARAM_MAX)+
                  "}; the Archon Expose parameter is 20 bits");
     }
+
+    // One sequence at a time. Concurrent do_expose() calls share this exposure
+    // mode's frame queue and completion flags, so whichever finishes first ends
+    // the other's consumer mid-sequence and its frames land in the wrong cube.
+    if (this->exposure_in_progress.exchange(true)) {
+      return this->fail_detailed(function, retstring, "exposure already running",
+                 "a sequence is still acquiring; wait for its reply before sending "
+                 "another expose, or ask for fewer frames per command");
+    }
+    const ScopedFlag busy{this->exposure_in_progress};
 
     // The producer exits on the abort state before reading anything, so without
     // this an exposure following an abort would quietly return no frames

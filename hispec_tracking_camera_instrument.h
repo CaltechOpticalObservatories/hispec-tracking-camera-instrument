@@ -119,6 +119,7 @@ namespace Camera {
       double pixel_time_usec{0.0};
       double readout_margin_msec{0.0};
 
+      std::atomic<bool> exposure_in_progress{false};
       bool is_freerunning{false};
       std::atomic<bool> is_freerun_active{false};  //!< true while the background freerun loop is running
       bool is_debug{false};
