@@ -26,8 +26,13 @@ namespace Camera {
     // deadline only delays reporting a failure.
     constexpr double DEFAULT_READOUT_MARGIN_MSEC = 5000.0;
 
-    // Preferred when present, so new firmware carries its own timing
-    constexpr const char* ACF_PIXEL_TIME_KEYS[] = {"TPIX", "TCLOCK"};
+    // End of the CDS signal sample window, which is what sets the pixel period.
+    // Preferred over the config file: the ACF owns this timing and camerad
+    // cannot edit the ACF.
+    constexpr const char* ACF_PIXEL_TIME_KEY = "SHD2";
+
+    // Archon timing is counted in 10 ns ticks
+    constexpr double ARCHON_TICK_USEC = 0.01;
 
     constexpr double USEC_PER_SEC = 1.0e6;
     constexpr double MSEC_PER_SEC = 1.0e3;
@@ -411,19 +416,18 @@ namespace Camera {
 
   /***** Camera::HispecTrackingCamera::effective_pixel_time_usec *************/
   /**
-   * @brief      pixel time in force, preferring the ACF's own value
-   * @details    New firmware carrying its own timing wins over PIXEL_TIME_USEC
-   *             from the config file.
+   * @brief      pixel time in force, from the ACF's CDS timing when it has one
+   * @details    Falls back to PIXEL_TIME_USEC from the config file, for a
+   *             firmware whose sample window does not set the pixel period.
    * @return     microseconds per pixel
    *
    */
   double HispecTrackingCamera::effective_pixel_time_usec() const {
-    for (const auto* key : ACF_PIXEL_TIME_KEYS) {
-      const auto entry = this->controller->configmap.find(key);
-      if (entry == this->controller->configmap.end()) continue;
+    const auto entry = this->controller->configmap.find(ACF_PIXEL_TIME_KEY);
+    if (entry != this->controller->configmap.end()) {
       try {
-        const double acf_value = std::stod(entry->second.value);
-        if (acf_value > 0) return acf_value;
+        const double ticks = std::stod(entry->second.value);
+        if (ticks > 0) return ticks * ARCHON_TICK_USEC;
       }
       catch (const std::exception &) { }  // unparsable, keep the configured value
     }
