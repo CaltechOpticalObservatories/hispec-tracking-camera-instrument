@@ -224,6 +224,9 @@ namespace Camera {
     set_dict_value(*keys, "bitpix", std::to_string(hispec->camera_info.bitpix));
     set_dict_value(*keys, "ref_channel_position", "");
     set_dict_value(*keys, "pixel_time", precise(hispec->effective_pixel_time_usec()));
+    // Constant, so it is built once per exposure rather than per frame: the
+    // per-frame set runs at the frame rate, which reaches 1 kHz in autofetch
+    set_dict_value(*keys, "exposure_time_unit", "");
     set_dict_value(*keys, "FIRMWARE", controller->firmware);
 
     if (hispec->is_windowed()) {
@@ -458,7 +461,6 @@ namespace Camera {
     set_dict_value(*frame_keys, "acq_time", get_timestamp());
     set_dict_value(*frame_keys, "exposure_time",
                    precise(hispec->camera_info.exposure_time->get()));
-    set_dict_value(*frame_keys, "exposure_time_unit", "");
     set_dict_value(*frame_keys, "n_reads", "1");
     meta.frame_keys = std::move(frame_keys);
 
