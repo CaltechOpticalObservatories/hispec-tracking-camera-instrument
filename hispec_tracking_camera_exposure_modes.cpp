@@ -85,6 +85,15 @@ namespace Camera {
       oss << std::setprecision(15) << value;
       return oss.str();
     }
+
+    // Which tapline the reference amp reads out changes with the mode
+    std::string refpix_channel_for(const ArchonController::modeinfo_t &mode,
+                                   const std::string &refpix_amp) {
+      for (int tap = 0; tap < mode.tapinfo.num_taps; ++tap) {
+        if (mode.tapinfo.ampname[tap] == refpix_amp) return std::to_string(tap + 1);
+      }
+      return "";
+    }
   }
 
   // Autofetch frame layout: 36-byte ASCII header followed by pixel data
@@ -214,9 +223,11 @@ namespace Camera {
     set_dict_value(*keys, "file_type", "");
     set_dict_value(*keys, "bitpix", std::to_string(hispec->camera_info.bitpix));
     set_dict_value(*keys, "ref_channel_position", "");
-    set_dict_value(*keys, "refpix_channel", "");
-    set_dict_value(*keys, "clock_rate", "");
-    set_dict_value(*keys, "pixel_time", "");
+    set_dict_value(*keys, "pixel_time", precise(hispec->effective_pixel_time_usec()));
+    // Constant, so it is built once per exposure rather than per frame: the
+    // per-frame set runs at the frame rate, which reaches 1 kHz in autofetch
+    set_dict_value(*keys, "exposure_time_unit", "");
+    set_dict_value(*keys, "FIRMWARE", controller->firmware);
 
     if (hispec->is_windowed()) {
       set_dict_value(*keys, "nskip_rows", std::to_string(hispec->window_vstart()));
@@ -227,13 +238,17 @@ namespace Camera {
     }
 
     if (!controller->selectedmode.empty()) {
-      auto &mode = controller->modemap[controller->selectedmode];
+      const auto &mode = controller->modemap[controller->selectedmode];
       if (auto it = mode.acfkeys.keydb.find("READOUTMODE"); it != mode.acfkeys.keydb.end())
         set_dict_value(*keys, "read_mode", it->second.keyvalue);
-      if (mode.geometry.num_detect > 0)
-        set_dict_value(*keys, "n_channels", std::to_string(mode.geometry.num_detect));
-      else
-        set_dict_value(*keys, "n_channels", "");
+
+      // The reference channel is not a detector channel, so it is not counted
+      const int num_taps = mode.tapinfo.num_taps;
+      set_dict_value(*keys, "n_channels", num_taps > 1 ? std::to_string(num_taps - 1) : "");
+      set_dict_value(*keys, "refpix_channel", refpix_channel_for(mode, hispec->reference_amp()));
+      // Same quantity the readout deadline is built from, so they cannot disagree
+      const double frame_sec = hispec->frame_readout_sec();
+      set_dict_value(*keys, "frame_time", frame_sec > 0.0 ? precise(frame_sec) : "");
     }
 
     // Bias voltages: MOD10/LVLC_Vn in the ACF's global [CONFIG] section

@@ -26,8 +26,16 @@ namespace Camera {
     // deadline only delays reporting a failure.
     constexpr double DEFAULT_READOUT_MARGIN_MSEC = 5000.0;
 
-    // Preferred when present, so new firmware carries its own timing
-    constexpr const char* ACF_PIXEL_TIME_KEYS[] = {"TPIX", "TCLOCK"};
+    // End of the CDS signal sample window, which is what sets the pixel period.
+    // Preferred over the config file: the ACF owns this timing and camerad
+    // cannot edit the ACF.
+    constexpr const char* ACF_PIXEL_TIME_KEY = "SHD2";
+
+    // Archon timing is counted in 10 ns ticks
+    constexpr double ARCHON_TICK_USEC = 0.01;
+
+    constexpr double USEC_PER_SEC = 1.0e6;
+    constexpr double MSEC_PER_SEC = 1.0e3;
   }
 
   const std::unordered_map<std::string, HispecTrackingCamera::CmdHandler>
@@ -169,6 +177,10 @@ namespace Camera {
     for (int row=0; row < this->configfile.n_rows; ++row) {
       const auto &param = this->configfile.param[row];
       const auto &arg   = this->configfile.arg[row];
+      if (param=="REFPIX_AMP" && !arg.empty()) {
+        this->refpix_amp = arg;
+        continue;
+      }
       try {
         if      (param=="PIXEL_TIME_USEC")     this->pixel_time_usec     = std::stod(arg);
         else if (param=="READOUT_MARGIN_MSEC") this->readout_margin_msec = std::stod(arg);
@@ -185,7 +197,8 @@ namespace Camera {
     logwrite(function, "LVDS module=" + std::to_string(this->lvds_module) +
                        " H2RG max pixel=" + std::to_string(this->h2rg_max_pixel) +
                        " pixel_time=" + std::to_string(this->pixel_time_usec) + " usec" +
-                       " readout_margin=" + std::to_string(this->readout_margin_msec) + " msec");
+                       " readout_margin=" + std::to_string(this->readout_margin_msec) + " msec" +
+                       " reference channel amp=" + this->refpix_amp);
 
     // Optimize Archon socket for high-speed streaming
     constexpr int socket_buf_size = 1024 * 1024;  // 1 MB
@@ -390,31 +403,59 @@ namespace Camera {
    *
    */
   int HispecTrackingCamera::readout_timeout_msec() const {
-    const auto mode = this->controller->modemap.find(this->controller->selectedmode);
-    if (mode == this->controller->modemap.end()) return 0;
+    const double readout_msec = this->frame_readout_sec() * MSEC_PER_SEC;
+    if (readout_msec <= 0.0) return 0;   // no camera mode selected
 
-    double pixel_time_usec = this->pixel_time_usec;
-    for (const auto* key : ACF_PIXEL_TIME_KEYS) {
-      const auto entry = this->controller->configmap.find(key);
-      if (entry == this->controller->configmap.end()) continue;
-      try {
-        const double acf_value = std::stod(entry->second.value);
-        if (acf_value > 0) { pixel_time_usec = acf_value; break; }
-      }
-      catch (const std::exception &) { }  // unparsable, keep the configured value
-    }
-
-    // Pixels one tap clocks out, which is what sets the readout duration
-    const auto &geometry = mode->second.geometry;
-    const double pixels_per_tap = static_cast<double>(geometry.pixelcount) * geometry.linecount;
-
-    const double readout_msec = pixels_per_tap * pixel_time_usec / 1000.0;
-    const double exposure_msec = this->controller->get_exptime() * 1000.0;
+    const double exposure_msec = this->controller->get_exptime() * MSEC_PER_SEC;
     const double total_msec = exposure_msec + readout_msec + this->readout_margin_msec;
 
     return std::max(1, static_cast<int>(std::lround(total_msec)));
   }
   /***** Camera::HispecTrackingCamera::readout_timeout_msec ******************/
+
+
+  /***** Camera::HispecTrackingCamera::effective_pixel_time_usec *************/
+  /**
+   * @brief      pixel time in force, from the ACF's CDS timing when it has one
+   * @details    Falls back to PIXEL_TIME_USEC from the config file, for a
+   *             firmware whose sample window does not set the pixel period.
+   * @return     microseconds per pixel
+   *
+   */
+  double HispecTrackingCamera::effective_pixel_time_usec() const {
+    const auto entry = this->controller->configmap.find(ACF_PIXEL_TIME_KEY);
+    if (entry != this->controller->configmap.end()) {
+      try {
+        const double ticks = std::stod(entry->second.value);
+        if (ticks > 0) return ticks * ARCHON_TICK_USEC;
+      }
+      catch (const std::exception &) { }  // unparsable, keep the configured value
+    }
+    return this->pixel_time_usec;
+  }
+  /***** Camera::HispecTrackingCamera::effective_pixel_time_usec *************/
+
+
+  /***** Camera::HispecTrackingCamera::frame_readout_sec *********************/
+  /**
+   * @brief      time to clock out one amplifier region in the selected mode
+   * @details    The readout deadline and the FRAMETME keyword are the same
+   *             quantity, so both come from here and cannot disagree.
+   * @return     seconds, or 0 if no camera mode is selected
+   *
+   */
+  double HispecTrackingCamera::frame_readout_sec() const {
+    const auto mode = this->controller->modemap.find(this->controller->selectedmode);
+    if (mode == this->controller->modemap.end()) return 0.0;
+
+    // Pixels one tap clocks out, which is what sets the readout duration
+    const auto &geometry = mode->second.geometry;
+    if (geometry.pixelcount <= 0 || geometry.linecount <= 0) return 0.0;
+    const double pixels_per_tap = static_cast<double>(geometry.pixelcount) * geometry.linecount;
+
+    return pixels_per_tap * this->effective_pixel_time_usec() / USEC_PER_SEC;
+  }
+  /***** Camera::HispecTrackingCamera::frame_readout_sec *********************/
 
 
   /***** Camera::HispecTrackingCamera::run_exposure_sequence *****************/

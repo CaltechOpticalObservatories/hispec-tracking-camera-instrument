@@ -66,7 +66,18 @@ namespace Camera {
       int window_vstart() const { return win_vstart; }
       int window_hstart() const { return win_hstart; }
 
+      const std::string& reference_amp() const { return refpix_amp; }
+
+      /** @brief  pixel time in force, from the ACF when it carries one */
+      double effective_pixel_time_usec() const;
+
+      /** @brief  seconds to clock out one amplifier region in the selected mode */
+      double frame_readout_sec() const;
+
     private:
+      // The reference channel's tapline moves with the mode, its amp does not
+      static constexpr const char* DEFAULT_REFPIX_AMP = "AM52";
+
       using CmdHandler = long (HispecTrackingCamera::*)(const std::string&, std::string&);
       static const std::unordered_map<std::string, CmdHandler> command_handlers_;
       static const std::unordered_map<std::string, std::string> _exposure_modes;
@@ -114,6 +125,7 @@ namespace Camera {
       // Set in configure_instrument()
       int lvds_module{0};
       int h2rg_max_pixel{0};
+      std::string refpix_amp{DEFAULT_REFPIX_AMP};
 
       // Readout deadline model, from the .cfg since it varies per system
       double pixel_time_usec{0.0};
