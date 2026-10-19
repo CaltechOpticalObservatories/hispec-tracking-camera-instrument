@@ -1,0 +1,229 @@
+#pragma once
+
+#include "exposure_modes.h"        // ExposureMode base class
+#include "archon_exposure_modes.h" // ArchonImageBuffer
+
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace Common { class FitsKeys; }
+
+namespace Camera {
+
+  namespace HispecTrackingCameraExposureMode {
+    constexpr const char* DEFAULT   = "DEFAULT";
+    constexpr const char* AUTOFETCH = "AUTOFETCH";
+    constexpr const char* ALLMODES[] = {DEFAULT};
+  }
+
+  class HispecTrackingCamera;
+
+  /** @brief  CPU and scheduling for one camera thread, from the .cfg */
+  struct ThreadPlacement {
+    static constexpr int ANY_CPU = -1;
+    static constexpr int NOT_REALTIME = 0;
+
+    int cpu{ANY_CPU};                //!< core to pin to; ANY_CPU keeps the inherited affinity
+    int rt_priority{NOT_REALTIME};   //!< SCHED_FIFO priority; NOT_REALTIME keeps SCHED_OTHER
+
+    /** @brief  false when the .cfg asked for nothing, so placement is skipped entirely */
+    bool is_configured() const { return cpu != ANY_CPU || rt_priority != NOT_REALTIME; }
+  };
+
+  /** @brief  "cpu 4, real-time priority 80 (SCHED_FIFO)" style summary for the log */
+  std::string describe_placement(const ThreadPlacement &placement);
+
+  /**
+   * @brief      name the calling thread and apply its CPU and scheduling
+   * @param[in]  name       thread name for ps/top, at most 15 characters
+   * @param[in]  placement  where and how to run
+   * @details    Called by the thread on itself at entry rather than by its
+   *             creator on native_handle(), so it has no window running unplaced
+   *             and covers threads this module does not create (do_expose()).
+   *             A refusal (EPERM without CAP_SYS_NICE or RLIMIT_RTPRIO) is
+   *             logged and the thread runs unplaced: degraded timing is better
+   *             than no frames. An unconfigured placement only names the thread.
+   */
+  void place_current_thread(const char* name, const ThreadPlacement &placement);
+
+  // Shared base: owns the frame queue and the consumer; subclasses implement
+  // only the producer (image_acquisition_thread).
+  class ExposureModeHispecTrackingBase : public ExposureModeTemplate<Camera::ArchonInterface> {
+    public:
+      ExposureModeHispecTrackingBase(Camera::ArchonInterface* iface)
+        : ExposureModeTemplate<Camera::ArchonInterface>(iface) { }
+
+      ~ExposureModeHispecTrackingBase() override;
+
+      /**
+       * @brief  one-shot consumer, spawned and joined by do_expose()
+       * @details  Always terminates when the producer is finished and the queue
+       *           is drained, whatever is_freerun says. do_expose() joins this
+       *           thread unconditionally, so it must never be the endless one.
+       */
+      void image_processing_thread() override;
+
+      /**
+       * @brief  start a freerun session and return immediately
+       * @return ERROR|NO_ERROR
+       * @details  Does not go through do_expose(), which spawns and joins a
+       *           thread pair per call -- per frame, in freerun. This spawns one
+       *           producer and one consumer for the whole session and returns,
+       *           so no thread is created per frame and no caller is parked.
+       *           Both are real thread objects, so priority and CPU affinity can
+       *           be set on each.
+       *
+       *           Ends on abort, or on a producer error. Reap with stop_freerun().
+       */
+      long start_freerun();
+
+      /**
+       * @brief  stop a freerun session and join both threads
+       * @return ERROR|NO_ERROR accumulated from the producer and consumer
+       * @details  Idempotent, and safe when no session was ever started. Blocks
+       *           only as long as the in-flight frame read takes. Called from
+       *           abort(), and from the destructor as a safety net.
+       */
+      long stop_freerun();
+
+      /** @brief  true while the freerun producer is still running */
+      bool is_freerun_running() const { return this->session_running.load(); }
+
+      void set_args(const std::vector<std::string> &a) { this->args = a; }
+      void set_debug(bool d) { this->is_debug = d; }
+      void set_take_stats(bool t) { this->take_stats = t; }
+
+      // Written by the command thread, read by the producer/consumer threads,
+      // so these have to be atomic: a plain bool here is a data race, and the
+      // compiler may hoist the load out of a loop so a change is never seen.
+      std::atomic<bool> is_debug{false};    //!< true to log per-frame debug info
+      std::atomic<bool> is_freerun{false};  //!< true: producer loops continuously
+      std::atomic<bool> take_stats{false};  //!< true to collect timing statistics
+
+      // Frames to acquire from one Archon trigger. Range-checked by the caller,
+      // since the producer hands it to prep_parameter(), which throws when it is
+      // out of range, and a throw leaving a thread terminates the process.
+      std::atomic<int> nseq{1};
+
+      // Frames the producer actually queued, so a failure can report how far
+      // the sequence got rather than only that it stopped
+      std::atomic<long long> frames_acquired{0};
+
+    protected:
+      void enqueue(std::shared_ptr<ArchonImageBuffer> buf);
+
+      // Built once at the start of image_acquisition_thread(), read by the
+      // consumer, so the values cannot shift mid-session.
+      std::shared_ptr<Common::FitsKeys> build_header_set(const std::string &operational_mode,
+                                                         const std::string &subframe_mode,
+                                                         bool is_freerun);
+
+      /**
+       * @brief  the consumer loop
+       * @param[in]  continuous  false: exit when the producer finishes (one exposure)
+       *                         true:  exit only on abort or stop_consumer (session)
+       * @details  The mode is a parameter, not a flag read from the object, so a
+       *           given consumer thread has one fixed behaviour for its whole
+       *           life and cannot change identity mid-loop.
+       */
+      void process_frames(bool continuous);
+
+      /** @brief  build the metadata for one frame and fan it out to frame_outputs */
+      void dispatch_one(const std::shared_ptr<ArchonImageBuffer> &buf, uint64_t sequence_number);
+
+      /**
+       * @brief  tell the session consumer to drain the queue and exit
+       * @details  Both flags are set under queue_mutex and followed by
+       *           notify_all. Set outside the lock, a consumer that has just
+       *           evaluated its wait predicate sleeps forever: the producer is
+       *           gone, so nothing will ever notify it again.
+       */
+      void signal_consumer_stop();
+
+      /**
+       * @brief      fetch one frame from an Archon buffer into dest
+       * @param[in]  bufindex    0-based frameinfo index of the buffer to read
+       * @param[in]  bufblocks   number of BLOCK_LEN blocks the Archon will send
+       * @param[out] dest        destination for the pixel data
+       * @param[in]  dest_bytes  capacity of dest, in bytes
+       * @return     ERROR|NO_ERROR
+       *
+       * @details    Moves bytes and nothing else: the caller decides how big a
+       *             frame is, so exactly one place in the code sizes a frame.
+       *             dest_bytes is passed so that relationship is checked here
+       *             rather than assumed -- an undersized dest is an early
+       *             return, not a heap overflow.
+       *
+       *             Equivalent to ArchonController::read_frame() minus its
+       *             unconditional per-call log, and reading the fetch in bulk
+       *             instead of a poll(), an ioctl spin and two socket reads per
+       *             kilobyte (~1.5us/KB, ~12ms on an 8MB frame).
+       *
+       *             Returning a status rather than aborting lets the caller
+       *             decide whether a bad frame ends the run: in freerun a
+       *             single failed fetch should not tear down the session.
+       */
+      long fetch_frame(int bufindex, unsigned bufblocks, char* dest, size_t dest_bytes);
+
+      /**
+       * @brief      wait for the Archon to complete a frame newer than baseline
+       * @param[in,out] baseline  newest frame seen before this one; updated on success
+       * @param[in]  first_of_sequence  true for the opening frame, which allows
+       *             twice the budget: a frame already in flight when the sequence
+       *             is triggered has to finish before ours begins
+       * @return     ERROR|NO_ERROR
+       *
+       * @details    Replaces ArchonController::wait_for_readout(), which derives
+       *             its own baseline from lastframe. get_frame_status() sets
+       *             lastframe to 0 whenever no buffer is flagged complete, which
+       *             is exactly the state a freshly loaded controller is in, so
+       *             the first frame of the first exposure reads as a thousand
+       *             missed ones. Tracking the baseline across the sequence
+       *             instead means it is never derived from a completeness flag.
+       */
+      long wait_for_frame(int &baseline, bool first_of_sequence);
+
+      std::queue<std::shared_ptr<ArchonImageBuffer>> imagebuf_queue;
+
+      // Staging buffer for one FETCH, reused for the life of the object: the
+      // Archon interleaves a 4-byte header every BLOCK_LEN bytes, so the wire
+      // image is read whole and the payload compacted out afterwards. Grows
+      // once, then never reallocates.
+      std::vector<char> fetch_buf;
+
+      // Freerun session threads. Kept joinable so they can be reaped; a thread
+      // still running against a destroyed object is undefined behaviour.
+      std::thread producer_thread;
+      std::thread consumer_thread;
+      std::atomic<bool> stop_consumer{false};   //!< ask the consumer to drain and exit
+      std::atomic<bool> session_running{false}; //!< true while the producer is alive
+      std::shared_ptr<const Common::FitsKeys> header_set;
+  };
+
+  // Default: one frame per readout, read straight into its own buffer.
+  class ExposureModeHispecTrackingDefault : public ExposureModeHispecTrackingBase {
+    public:
+      ExposureModeHispecTrackingDefault(Camera::ArchonInterface* iface)
+        : ExposureModeHispecTrackingBase(iface) {
+          type=HispecTrackingCameraExposureMode::DEFAULT;
+        }
+      void image_acquisition_thread() override;
+  };
+
+  // Autofetch: continuous streaming from the Archon via framebuf.
+  class ExposureModeHispecTrackingAutofetch : public ExposureModeHispecTrackingBase {
+    public:
+      ExposureModeHispecTrackingAutofetch(Camera::ArchonInterface* iface)
+        : ExposureModeHispecTrackingBase(iface) {
+          type=HispecTrackingCameraExposureMode::AUTOFETCH;
+        }
+      void image_acquisition_thread() override;
+  };
+
+}

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["scikit-build-core>=0.8", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "camera-interface-tracking"
+version = "0.1.0"
+description = "camerad Python bindings built for the HISPEC tracking camera"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Caltech Optical Observatories" }]
+
+[project.urls]
+Repository = "https://github.com/CaltechOpticalObservatories/hispec-tracking-camera-instrument"
+
+[tool.scikit-build]
+cmake.version = ">=3.24"
+# Only the module goes in the wheel; the daemon component carries the
+# executable and the config
+build.targets = ["camera_interface"]
+install.components = ["python"]
+
+[tool.scikit-build.cmake.define]
+BUILD_PYTHON_MODULE = "ON"
+CMAKE_BUILD_TYPE = "Release"
+# The tracking camera publishes frames to shared memory, so the build fails
+# rather than silently producing a module that logs "compiled without SHM
+# support" at runtime. Needs ImageStreamIO; see the README if it is not found.
+ENABLE_SHM_OUTPUT = "ON"
