@@ -69,9 +69,15 @@ namespace Camera {
     }
 
     std::string subframe_mode_for(HispecTrackingCamera *hispec) {
-      if (hispec->is_windowed()) return "guiding";
-      const auto &mode = hispec->controller->modemap[hispec->controller->selectedmode];
-      return (mode.geometry.linecount >= hispec->detector_rows()) ? "fullframe" : "ROI";
+      const std::string &section = hispec->controller->selectedmode;
+      if (hispec->is_windowed() || section.find("GUIDING") != std::string::npos) return "guiding";
+      const auto &mode = hispec->controller->modemap[section];
+      return (mode.geometry.linecount >= hispec->detector_rows()) ? "full_frame" : "roi";
+    }
+
+    std::string operational_mode_for(bool is_autofetch, bool is_freerun) {
+      if (is_freerun) return is_autofetch ? "freerun+autofetch" : "freerun";
+      return is_autofetch ? "autofetch" : "default";
     }
 
     // std::to_string(double) truncates to 6 decimals; round-trip full precision instead
@@ -412,7 +418,7 @@ namespace Camera {
 
   /***** Camera::ExposureModeHispecTrackingBase::build_header_set ************/
   std::shared_ptr<Common::FitsKeys> ExposureModeHispecTrackingBase::build_header_set(
-      const std::string &operational_mode, const std::string &subframe_mode, bool is_freerun) {
+      bool is_autofetch, bool is_freerun) {
     auto* hispec = static_cast<HispecTrackingCamera*>(this->interface);
     auto* controller = hispec->controller;
     auto keys = std::make_shared<Common::FitsKeys>();
@@ -420,8 +426,9 @@ namespace Camera {
     for (const auto &e : hispec->camera_info.systemkeys.keydb) keys->keydb[e.first] = e.second;
     for (const auto &e : hispec->camera_info.userkeys.keydb)   keys->keydb[e.first] = e.second;
 
-    set_dict_value(*keys, "operational_mode", operational_mode);
-    set_dict_value(*keys, "subframe_mode", subframe_mode);
+    set_dict_value(*keys, "operational_mode", operational_mode_for(is_autofetch, is_freerun));
+    set_dict_value(*keys, "subframe_mode", subframe_mode_for(hispec));
+    set_dict_value(*keys, "read_mode", hispec->readout_mode());
     set_dict_value(*keys, "FREERUN", is_freerun ? "TRUE" : "FALSE");
     set_dict_value(*keys, "file_type", "");
     set_dict_value(*keys, "bitpix", std::to_string(hispec->camera_info.bitpix));
@@ -442,9 +449,6 @@ namespace Camera {
 
     if (!controller->selectedmode.empty()) {
       const auto &mode = controller->modemap[controller->selectedmode];
-      if (auto it = mode.acfkeys.keydb.find("READOUTMODE"); it != mode.acfkeys.keydb.end())
-        set_dict_value(*keys, "read_mode", it->second.keyvalue);
-
       // The reference channel is not a detector channel, so it is not counted
       const int num_taps = mode.tapinfo.num_taps;
       set_dict_value(*keys, "n_channels", num_taps > 1 ? std::to_string(num_taps - 1) : "");
@@ -852,8 +856,7 @@ namespace Camera {
     // Read once so this thread has one fixed behaviour for its whole life
     const bool freerun = this->is_freerun.load();
 
-    this->header_set = build_header_set(HispecTrackingCameraExposureMode::DEFAULT,
-                                         subframe_mode_for(hispec), freerun);
+    this->header_set = build_header_set(false, freerun);
 
     const int nseq = this->nseq.load();
 
@@ -996,8 +999,7 @@ namespace Camera {
     // Read once so this thread has one fixed behaviour for its whole life
     const bool freerun = this->is_freerun.load();
 
-    this->header_set = build_header_set(HispecTrackingCameraExposureMode::AUTOFETCH,
-                                         subframe_mode_for(hispec), freerun);
+    this->header_set = build_header_set(true, freerun);
 
     int nseq = 1;
     const std::string args = this->get_args_string();

@@ -120,9 +120,7 @@ namespace Camera {
 
       // Built once at the start of image_acquisition_thread(), read by the
       // consumer, so the values cannot shift mid-session.
-      std::shared_ptr<Common::FitsKeys> build_header_set(const std::string &operational_mode,
-                                                         const std::string &subframe_mode,
-                                                         bool is_freerun);
+      std::shared_ptr<Common::FitsKeys> build_header_set(bool is_autofetch, bool is_freerun);
 
       /**
        * @brief  the consumer loop
