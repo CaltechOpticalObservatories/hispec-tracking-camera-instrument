@@ -313,6 +313,25 @@ namespace Camera {
   /***** Camera::HispecTrackingCamera::set_exposure_mode **********************/
 
 
+  /***** Camera::HispecTrackingCamera::load_firmware *************************/
+  /**
+   * @brief      load the ACF, then select the hispec exposure pipeline
+   * @details    A load leaves no exposure mode selected, and this instrument
+   *             has one pipeline, so it is selected after every load. Help, or
+   *             a failed load, selects nothing.
+   * @param[in]  args       fully qualified path of ACF
+   * @param[out] retstring  contains help on request, otherwise not used
+   * @return     ERROR|NO_ERROR|HELP
+   *
+   */
+  long HispecTrackingCamera::load_firmware(const std::string &args, std::string &retstring) {
+    long error = this->ArchonInterface::load_firmware(args, retstring);
+    if (error != NO_ERROR) return error;
+    return this->set_exposure_mode(HispecTrackingCameraExposureMode::DEFAULT, {});
+  }
+  /***** Camera::HispecTrackingCamera::load_firmware *************************/
+
+
   /***** Camera::HispecTrackingCamera::_autofetch_mode ***********************/
   /**
    * @brief  toggle autofetch, then re-select the exposure pipeline so the
@@ -332,7 +351,7 @@ namespace Camera {
     }
 
     if (error == NO_ERROR && !args.empty()) {
-      error = this->set_exposure_mode(this->default_exposure_mode_name(), {});
+      error = this->set_exposure_mode(HispecTrackingCameraExposureMode::DEFAULT, {});
     }
     return error;
   }
@@ -954,7 +973,7 @@ namespace Camera {
     // name, loads the mode's parameters and geometry from the ACF, and applies
     // them (with its own APPLYCDS when the geometry changes). On success it sets
     // controller->selectedmode to the canonical modemap key.
-    long error = this->ArchonInterface::set_camera_mode(args, retstring);
+    long error = this->ArchonInterface::acfmode(args, retstring);
     if (error != NO_ERROR) {
       return this->fail_detailed(function, retstring, "camera mode not set",
                  "\""+args+"\" was rejected; it must name a [MODE_*] section of the "
@@ -1392,7 +1411,7 @@ namespace Camera {
       static_cast<uint32_t>(rows)
     };
 
-    error = this->set_camera_mode("FULLFRAME", retstring);
+    error = this->ArchonInterface::acfmode("FULLFRAME", retstring);
 
     return error;
   }
