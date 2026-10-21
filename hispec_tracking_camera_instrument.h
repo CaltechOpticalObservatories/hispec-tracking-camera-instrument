@@ -61,6 +61,7 @@ namespace Camera {
       int window_hstart() const { return win_hstart; }
 
       const std::string& reference_amp() const { return refpix_amp; }
+      const std::string& readout_mode() const { return cur_exposure_mode; }
 
       /** @brief  pixel time in force, from the ACF when it carries one */
       double effective_pixel_time_usec() const;
