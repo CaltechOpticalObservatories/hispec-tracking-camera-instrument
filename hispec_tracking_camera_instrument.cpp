@@ -1204,10 +1204,12 @@ namespace Camera {
       static_cast<uint32_t>(this->win_vstart),
       static_cast<uint32_t>(this->win_vstop)
     };
+    // Autofetch sizes its reads from section_size, which set_axes derives
     this->camera_info.detector_pixels = {
-      static_cast<uint32_t>(pixelcount),
+      static_cast<uint32_t>(pixelcount * mode.tapinfo.num_taps),
       static_cast<uint32_t>(rows)
     };
+    this->camera_info.set_axes(16);
     //resize the image buffer TODO::
     //this->resize_image_buffer(pixelcount, rows);
     return error;
