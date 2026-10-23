@@ -23,6 +23,7 @@ namespace Camera {
 
       std::vector<std::string> get_exposure_modes() override;
       long set_exposure_mode(const std::string &modein, const std::vector<std::string> &modeargs) override;
+      long load_firmware(const std::string &args, std::string &retstring) override;
       long expose(const std::string args, std::string &retstring) override;
 
       /**
@@ -32,10 +33,6 @@ namespace Camera {
        *           is fully stopped and freerun can be restarted immediately.
        */
       long abort(const std::string args, std::string &retstring) override;
-
-      std::string default_exposure_mode_name() const override {
-        return std::string(HispecTrackingCameraExposureMode::DEFAULT);
-      }
 
       /**
        * @brief      one-line snapshot of what the camera was doing
