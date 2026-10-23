@@ -23,12 +23,9 @@ set(CAMERAD_PACKAGE_NAME "camera_interface_tracking" CACHE STRING
 
 include(FetchContent)
 
-# The core's submodules are the other instruments, two of them private, and
-# none of them are needed to build this one
 FetchContent_Declare(camera_interface
   GIT_REPOSITORY https://github.com/CaltechOpticalObservatories/camera-interface
   GIT_TAG        main
-  GIT_SUBMODULES ""
 )
 
 set(CONTROLLER archon CACHE STRING "Controller the tracking camera uses")

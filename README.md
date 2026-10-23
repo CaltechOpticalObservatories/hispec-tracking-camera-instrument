@@ -1,9 +1,13 @@
 # HISPEC Tracking Camera Instrument
 
-Camerad 2.0 instrument module for the HISPEC tracking camera using the Archon controller.
+Camerad 2.0 instrument module for the HISPEC acquisition and tracking camera: a 2048x2048 H2RG on an
+Archon controller.
 
 This project owns the instrument and pulls camera-interface in as a dependency, so it
 builds on its own.
+
+Full documentation: <https://caltechopticalobservatories.github.io/hispec-tracking-camera-instrument/>.
+Shared `camerad` behaviour is in the [camera-interface docs](https://caltechopticalobservatories.github.io/camera-interface/).
 
 ## Building
 
@@ -45,4 +49,28 @@ at explicitly:
 
 ```bash
 pip install . --config-settings=cmake.define.ImageStreamIO_DIR=/usr/local/lib/cmake
+```
+
+## Commands
+
+Added to the base `camerad` command set:
+
+| Command | Purpose |
+|---|---|
+| `mode [<name>]` | Select or report the ACF camera mode (`[MODE_*]` section) |
+| `exposure [utr_rr\|utr_gr\|rx\|rxr]` | Select or report the H2RG readout mode |
+| `autofetch_mode [true\|false]` | Have the controller stream frames as they are read |
+| `freerun 1\|0` | Arm or disarm continuous exposure; `abort` stops a running loop |
+| `roi [...]` | Set or report the region of interest |
+| `window_mode [true\|false]` | Enter or leave windowed (guiding) readout |
+| `debug [true\|false]` | Per-frame logging in the acquisition threads |
+| `take_stats [true\|false]` | Per-frame timing statistics |
+
+The shipped configuration is `config/hispecatc.cfg`; its paths point at the development machine.
+
+## Documentation
+
+```bash
+pip install -r docs/requirements.txt
+sphinx-build -W docs docs/_build/html
 ```
