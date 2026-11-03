@@ -43,13 +43,9 @@ publishes frames to shared memory. It needs
 if CMake cannot find it rather than producing a module that logs "compiled
 without SHM support" only once a camera is running.
 
-CMake looks for the package config under `<prefix>/lib/cmake/ImageStreamIO/`.
-An install that leaves it directly in `<prefix>/lib/cmake/` has to be pointed
-at explicitly:
-
-```bash
-pip install . --config-settings=cmake.define.ImageStreamIO_DIR=/usr/local/lib/cmake
-```
+An ImageStreamIO installed under `/usr/local` is found with no flags. For
+another prefix, pass
+`--config-settings=cmake.define.ImageStreamIO_DIR=<prefix>/lib/cmake`.
 
 ## Commands
 
