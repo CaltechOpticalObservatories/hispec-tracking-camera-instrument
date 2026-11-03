@@ -277,11 +277,8 @@ instruments’ builds. Any CMake option passes through pip, for example
 <code class="docutils literal notranslate"><span class="pre">--config-settings=cmake.define.CMAKE_BUILD_TYPE=Debug</span></code>.</p>
 <p><code class="docutils literal notranslate"><span class="pre">ENABLE_SHM_OUTPUT</span></code> is on by default, because the tracking camera publishes frames to shared memory.
 It needs <a class="reference external" href="https://github.com/milk-org/ImageStreamIO">ImageStreamIO</a>, and the build stops if CMake
-cannot find it. If its package config sits directly in <code class="docutils literal notranslate"><span class="pre">&lt;prefix&gt;/lib/cmake/</span></code> rather than
-<code class="docutils literal notranslate"><span class="pre">&lt;prefix&gt;/lib/cmake/ImageStreamIO/</span></code>, point at it:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>.<span class="w"> </span>--config-settings<span class="o">=</span>cmake.define.ImageStreamIO_DIR<span class="o">=</span>/usr/local/lib/cmake
-</pre></div>
-</div>
+cannot find it. An install under <code class="docutils literal notranslate"><span class="pre">/usr/local</span></code> is found with no flags; for another prefix, pass
+<code class="docutils literal notranslate"><span class="pre">--config-settings=cmake.define.ImageStreamIO_DIR=&lt;prefix&gt;/lib/cmake</span></code>.</p>
 <div class="toctree-wrapper compound">
 </div>
 </section>

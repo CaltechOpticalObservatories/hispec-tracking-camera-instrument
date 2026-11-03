@@ -33,12 +33,8 @@ instruments' builds. Any CMake option passes through pip, for example
 
 `ENABLE_SHM_OUTPUT` is on by default, because the tracking camera publishes frames to shared memory.
 It needs [ImageStreamIO](https://github.com/milk-org/ImageStreamIO), and the build stops if CMake
-cannot find it. If its package config sits directly in `<prefix>/lib/cmake/` rather than
-`<prefix>/lib/cmake/ImageStreamIO/`, point at it:
-
-```bash
-pip install . --config-settings=cmake.define.ImageStreamIO_DIR=/usr/local/lib/cmake
-```
+cannot find it. An install under `/usr/local` is found with no flags; for another prefix, pass
+`--config-settings=cmake.define.ImageStreamIO_DIR=<prefix>/lib/cmake`.
 
 ```{toctree}
 :hidden:
