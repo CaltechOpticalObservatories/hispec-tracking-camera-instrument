@@ -387,6 +387,7 @@ namespace Camera {
       uint64_t timestamp = std::stoull(header.substr(20, 16), nullptr, 16);
 
       controller->frameinfo.bufframen[controller->frameinfo.index] = frame_number;
+      controller->frameinfo.buftimestamp[controller->frameinfo.index] = timestamp;
       controller->lastframe = frame_number;
 
       // Archon timestamps are in 0.01 us units
