@@ -16,7 +16,7 @@ These are added to every file on top of the {core}`core keywords <fits/>`:
 | `EXPMJDST`, `ACQTIME` | MJD and UTC timestamp of the frame |
 | `NREADS` | Reads in the frame, `1` |
 | `DETBITS` | Detector bit depth |
-| `PIXTIME` | Pixel time in force, in microseconds |
+| `PIXTIME` | Pixel time in force, in microseconds, from the ACF's `tpix` (see [configuration](configuration.md#readout-deadline)) |
 | `FRAMETME` | Seconds to read out one amplifier region, the same figure the readout deadline uses |
 | `NCHANLS` | Detector channels, not counting the reference channel |
 | `REFPXAMP` | Channel read by `REFPIX_AMP` in the current camera mode |

@@ -270,7 +270,7 @@ paths on the development machine; set them for yours.</p>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">PIXEL_TIME_USEC</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">7.0</span></code></p></td>
-<td><p>Pixel time, used only when the ACF has no <code class="docutils literal notranslate"><span class="pre">SHD2</span></code> to derive it from</p></td>
+<td><p>Pixel time, used only when the ACF has neither <code class="docutils literal notranslate"><span class="pre">tpix</span></code> nor <code class="docutils literal notranslate"><span class="pre">SHD2</span></code></p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">READOUT_MARGIN_MSEC</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">5000</span></code></p></td>
@@ -291,8 +291,9 @@ paths on the development machine; set them for yours.</p>
 <h2>Readout deadline<a class="headerlink" href="#readout-deadline" title="Link to this heading">¶</a></h2>
 <p>Each frame must arrive within exposure time + pixels per tap x pixel time + <code class="docutils literal notranslate"><span class="pre">READOUT_MARGIN_MSEC</span></code>,
 recomputed per <code class="docutils literal notranslate"><span class="pre">expose</span></code> so a full frame and a small ROI share one setting. A frame that misses it
-is reported lost. The pixel time comes from the ACF’s <code class="docutils literal notranslate"><span class="pre">SHD2</span></code> (in 10 ns ticks) when present, else
-<code class="docutils literal notranslate"><span class="pre">PIXEL_TIME_USEC</span></code>. <code class="docutils literal notranslate"><span class="pre">PIXEL_TIME_USEC</span></code> must be positive and <code class="docutils literal notranslate"><span class="pre">READOUT_MARGIN_MSEC</span></code> non-negative; a
+is reported lost. The pixel time comes from the ACF, in 10 ns ticks: the <code class="docutils literal notranslate"><span class="pre">tpix</span></code> parameter of the
+selected mode, else the global <code class="docutils literal notranslate"><span class="pre">tpix</span></code>, else the CDS sample end <code class="docutils literal notranslate"><span class="pre">SHD2</span></code>, which falls short of the full
+pixel. Without any of them it is <code class="docutils literal notranslate"><span class="pre">PIXEL_TIME_USEC</span></code>. <code class="docutils literal notranslate"><span class="pre">PIXEL_TIME_USEC</span></code> must be positive and <code class="docutils literal notranslate"><span class="pre">READOUT_MARGIN_MSEC</span></code> non-negative; a
 non-numeric value fails startup.</p>
 </section>
 <section id="thread-placement">
