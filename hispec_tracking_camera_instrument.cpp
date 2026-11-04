@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <iterator>
 #include <optional>
+#include <vector>
 #include <sched.h>
 #include <string_view>
 #include <unistd.h>
@@ -24,9 +25,13 @@ namespace Camera {
     // deadline only delays reporting a failure.
     constexpr double DEFAULT_READOUT_MARGIN_MSEC = 5000.0;
 
-    // End of the CDS signal sample window, which is what sets the pixel period.
+    // Pixel period, a sequencer parameter a mode section can override.
     // Preferred over the config file: the ACF owns this timing and camerad
     // cannot edit the ACF.
+    constexpr const char* ACF_PIXEL_PERIOD_PARAM = "tpix";
+
+    // End of the CDS signal sample window, short of the full pixel period;
+    // for an ACF without tpix
     constexpr const char* ACF_PIXEL_TIME_KEY = "SHD2";
 
     // Archon timing is counted in 10 ns ticks
@@ -34,6 +39,15 @@ namespace Camera {
 
     constexpr double USEC_PER_SEC = 1.0e6;
     constexpr double MSEC_PER_SEC = 1.0e3;
+
+    std::optional<double> positive_ticks(const std::string &text) {
+      try {
+        const double ticks = std::stod(text);
+        if (ticks > 0) return ticks;
+      }
+      catch (const std::exception &) { }  // unparsable, so the next source decides
+      return std::nullopt;
+    }
 
     constexpr std::string_view ANY_CPU_TOKEN = "any";
     constexpr std::string_view WHITESPACE = " \t";
@@ -560,20 +574,30 @@ namespace Camera {
 
   /***** Camera::HispecTrackingCamera::effective_pixel_time_usec *************/
   /**
-   * @brief      pixel time in force, from the ACF's CDS timing when it has one
-   * @details    Falls back to PIXEL_TIME_USEC from the config file, for a
-   *             firmware whose sample window does not set the pixel period.
+   * @brief      pixel time in force, from the ACF when it carries one
+   * @details    The selected mode's tpix, then the global tpix, then the CDS
+   *             sample end SHD2, then PIXEL_TIME_USEC from the config file.
    * @return     microseconds per pixel
    *
    */
   double HispecTrackingCamera::effective_pixel_time_usec() const {
-    const auto entry = this->controller->configmap.find(ACF_PIXEL_TIME_KEY);
-    if (entry != this->controller->configmap.end()) {
-      try {
-        const double ticks = std::stod(entry->second.value);
-        if (ticks > 0) return ticks * ARCHON_TICK_USEC;
-      }
-      catch (const std::exception &) { }  // unparsable, keep the configured value
+    const auto* controller = this->controller;
+    std::vector<std::string> sources;
+    const auto mode = controller->modemap.find(controller->selectedmode);
+    if (mode != controller->modemap.end()) {
+      const auto param = mode->second.parammap.find(ACF_PIXEL_PERIOD_PARAM);
+      if (param != mode->second.parammap.end()) sources.push_back(param->second.value);
+    }
+    if (const auto param = controller->parammap.find(ACF_PIXEL_PERIOD_PARAM);
+        param != controller->parammap.end()) {
+      sources.push_back(param->second.value);
+    }
+    if (const auto entry = controller->configmap.find(ACF_PIXEL_TIME_KEY);
+        entry != controller->configmap.end()) {
+      sources.push_back(entry->second.value);
+    }
+    for (const auto &source : sources) {
+      if (const auto ticks = positive_ticks(source)) return *ticks * ARCHON_TICK_USEC;
     }
     return this->pixel_time_usec;
   }
