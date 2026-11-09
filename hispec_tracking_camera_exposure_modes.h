@@ -115,6 +115,10 @@ namespace Camera {
       // the sequence got rather than only that it stopped
       std::atomic<long long> frames_acquired{0};
 
+      // Frames the controller overwrote before the host fetched them, which the
+      // producer skips past rather than stopping
+      std::atomic<long long> frames_dropped{0};
+
     protected:
       void enqueue(std::shared_ptr<ArchonImageBuffer> buf);
 

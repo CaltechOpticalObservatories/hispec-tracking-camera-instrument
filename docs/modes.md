@@ -49,3 +49,8 @@ controller's control connection instead, so their replies are not lost behind fr
 
 `abort` during freerun returns once both threads have joined, so freerun can be restarted straight
 away.
+
+If the host falls behind and the controller overwrites frames before they are fetched, acquisition
+logs a warning, counts them, and continues from the newest frame; the count is in the line logged
+when it stops. A counted `expose` still writes every frame that arrived, then returns an error
+naming how many were dropped, since the sequence has gaps; each file's `FRAMENO` shows where.

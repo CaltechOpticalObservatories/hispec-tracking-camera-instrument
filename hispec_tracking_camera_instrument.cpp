@@ -718,6 +718,14 @@ namespace Camera {
                                  "gives the failing step");
     }
 
+    // The frames that did arrive are written; the caller still has to know the sequence has gaps
+    if (const long long dropped = mode->frames_dropped.load(); dropped > 0) {
+      return this->fail_detailed(function, retstring, "frames dropped",
+                                 std::to_string(dropped)+" of "+std::to_string(nseq)+
+                                 " frame(s) were overwritten before the host fetched them; "
+                                 "the other "+std::to_string(nseq-dropped)+" were written");
+    }
+
     retstring = std::to_string(nseq);
 
     return NO_ERROR;
