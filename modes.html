@@ -336,6 +336,10 @@ this module makes in that state, including <code class="docutils literal notrans
 controller’s control connection instead, so their replies are not lost behind frame data.</p>
 <p><code class="docutils literal notranslate"><span class="pre">abort</span></code> during freerun returns once both threads have joined, so freerun can be restarted straight
 away.</p>
+<p>If the host falls behind and the controller overwrites frames before they are fetched, acquisition
+logs a warning, counts them, and continues from the newest frame; the count is in the line logged
+when it stops. A counted <code class="docutils literal notranslate"><span class="pre">expose</span></code> still writes every frame that arrived, then returns an error
+naming how many were dropped, since the sequence has gaps; each file’s <code class="docutils literal notranslate"><span class="pre">FRAMENO</span></code> shows where.</p>
 </section>
 </section>
 
