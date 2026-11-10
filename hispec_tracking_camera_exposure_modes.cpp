@@ -617,12 +617,15 @@ namespace Camera {
 
         if (newest > baseline && index >= 0) {
           if (newest > baseline + 1) {
-            hispec->log_error(function, "dropped frames",
-                       std::to_string(newest-baseline-1)+" frame(s) were overwritten "
+            const int missed = newest - baseline - 1;
+            const std::string detail = std::to_string(missed)+" frame(s) were overwritten "
                        "before the host could fetch them: expected frame "+
                        std::to_string(baseline+1)+" but the newest complete buffer is "+
-                       std::to_string(newest)+"; the controller is outrunning the fetch");
-            return ERROR;
+                       std::to_string(newest);
+            this->frames_dropped += missed;
+            logwrite(function, "WARNING dropped frames: "+detail+"; continuing from "+
+                               std::to_string(newest)+" ("+
+                               std::to_string(this->frames_dropped.load())+" this session)");
           }
           controller->frameinfo.index.store(index);
           baseline = newest;
@@ -895,10 +898,12 @@ namespace Camera {
     // Instantiate all variables possible so we don't have to do it in the loop, save time and avoid memory fragmentation.
     long long frames_read = 0;
     this->frames_acquired.store(0);
+    this->frames_dropped.store(0);
     int consecutive_errors = 0;  //!< reset by every good frame; see MAX_CONSECUTIVE_ERRORS
 
     for (long long i = 0; freerun || i < nseq; ++i) {
       if (this->interface->is_aborted()) break;
+      const long long dropped_before = this->frames_dropped.load();
       if (this->wait_for_frame(baseline, i == 0) != NO_ERROR) {
         // wait_for_frame reports an abort the same way it reports a timeout,
         // so without this a deliberate stop is returned to the caller as a
@@ -907,6 +912,8 @@ namespace Camera {
         return;
       }
       if (this->interface->is_aborted()) break;
+      // Skipped frames still belong to the sequence, so it ends where the controller's does
+      i += this->frames_dropped.load() - dropped_before;
 
       const auto idx = controller->frameinfo.index.load();
 
@@ -973,9 +980,11 @@ namespace Camera {
     }
 
     logwrite(function, freerun
-             ? "freerun acquisition stopped after " + std::to_string(frames_read) + " frames"
+             ? "freerun acquisition stopped after " + std::to_string(frames_read) +
+               " frames, " + std::to_string(this->frames_dropped.load()) + " dropped"
              : "sequence complete: " + std::to_string(frames_read) + " of " +
-               std::to_string(nseq) + " frames");
+               std::to_string(nseq) + " frames, " +
+               std::to_string(this->frames_dropped.load()) + " dropped");
   }
   /***** Camera::ExposureModeHispecTrackingDefault::image_acquisition_thread */
 
