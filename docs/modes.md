@@ -12,7 +12,7 @@ Camera mode (`mode`)
 
 Readout mode (`exposure`)
 : Selects the H2RG readout scheme by setting the matching `mode_*` ACF parameter to 1 and the
-  others to 0, so the ACF must define all four.
+  others to 0, so the ACF must define all five.
 
     | Argument | ACF parameter | Scheme |
     |---|---|---|
@@ -20,6 +20,7 @@ Readout mode (`exposure`)
     | `utr_gr` | `mode_UTR_GR` | Up the ramp, guided read |
     | `rx` | `mode_RX` | Reset-execute |
     | `rxr` | `mode_RXR` | Reset-execute-read |
+    | `interleave` | `mode_InterleavedGuiding` | Science rows alternating with a guide window, see [commands](commands.md#interleaved-readout) |
 
   Selecting `rxr` doubles `PIXELCOUNT`.
 

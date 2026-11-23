@@ -2,10 +2,14 @@
 #include "hispec_tracking_camera_exposure_modes.h"
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <iomanip>
 #include <iterator>
+#include <mutex>
 #include <optional>
+#include <sstream>
+#include <thread>
 #include <vector>
 #include <sched.h>
 #include <string_view>
@@ -40,6 +44,28 @@ namespace Camera {
     constexpr double USEC_PER_SEC = 1.0e6;
     constexpr double MSEC_PER_SEC = 1.0e3;
 
+    // H2RG window bounds: each register takes its base address plus a pixel index
+    constexpr int H2RG_VSTART_REGISTER = 32768;  // 1000 000000000000
+    constexpr int H2RG_VSTOP_REGISTER  = 36864;  // 1001 000000000000
+    constexpr int H2RG_HSTART_REGISTER = 40960;  // 1010 000000000000
+    constexpr int H2RG_HSTOP_REGISTER  = 45056;  // 1011 000000000000
+
+    // Each write restarts the VCPU, which sends the data register's word to
+    // the H2RG if it finds the trigger register set. Level, not edge, so a
+    // write repeated after a refusal still lands exactly as intended.
+    constexpr int VCPU_DATA_INREG    = 1;
+    constexpr int VCPU_TRIGGER_INREG = 0;
+
+    // How long a register write waits out a frame fetch on the same socket.
+    // Far longer than fetching the largest frame, so it only expires on a
+    // stalled readout; the poll is coarse because each refusal is logged.
+    constexpr auto INREG_BUSY_WAIT = std::chrono::milliseconds(2000);
+    constexpr auto INREG_BUSY_POLL = std::chrono::milliseconds(5);
+
+    // The interleaved science window spans two amplifiers; the reference
+    // channel rides along on a third
+    constexpr int INTERLEAVE_SCIENCE_AMPS = 2;
+
     std::optional<double> positive_ticks(const std::string &text) {
       try {
         const double ticks = std::stod(text);
@@ -65,6 +91,19 @@ namespace Camera {
       const auto [stop, status] = std::from_chars(text.data(), end, value);
       if (status != std::errc{} || stop != end) return std::nullopt;
       return value;
+    }
+
+    // All or nothing. Run ahead of validate_roi(), whose std::stoi reads "12x"
+    // as 12 and throws on a value too large for an int, which nothing catches.
+    std::optional<std::vector<int>> parse_ints(const std::vector<std::string> &tokens) {
+      std::vector<int> values;
+      values.reserve(tokens.size());
+      for (const auto &token : tokens) {
+        const auto value = parse_int(token);
+        if (!value) return std::nullopt;
+        values.push_back(*value);
+      }
+      return values;
     }
 
     // Parse "<cpu|any>[,<SCHED_FIFO priority>]". Rejects at startup what the
@@ -111,7 +150,10 @@ namespace Camera {
     {"mode", &HispecTrackingCamera::mode},
     {"freerun", &HispecTrackingCamera::freerun},
     {"debug", &HispecTrackingCamera::_debug},
-    {"take_stats", &HispecTrackingCamera::_take_stats}
+    {"take_stats", &HispecTrackingCamera::_take_stats},
+    {"interleave_science", &HispecTrackingCamera::interleave_science},
+    {"interleave_guide", &HispecTrackingCamera::interleave_guide},
+    {"interleave_set", &HispecTrackingCamera::interleave_set}
   };
   // FASTLOADPARAM is case-sensitive, so these must match the ACF exactly
   const std::unordered_map<std::string, std::string>
@@ -119,7 +161,8 @@ namespace Camera {
     {"utr_rr", "mode_UTR_RR"},
     {"utr_gr", "mode_UTR_GR"},
     {"rx", "mode_RX"},
-    {"rxr", "mode_RXR"}
+    {"rxr", "mode_RXR"},
+    {"interleave", "mode_InterleavedGuiding"}
   };
 
   /***** Camera::HispecTrackingCamera::is_instrument_command ******************/
@@ -1652,5 +1695,276 @@ namespace Camera {
     return error;
   }
   /***** Camera::HispecTrackingCamera::window_mode ***************************/
+
+  /***** Camera::HispecTrackingCamera::interleave_science ********************/
+  /**
+   * @brief      set or report the science window of the interleaved readout
+   * @details    Centred on the detector like "roi <height> <width>". Only
+   *             records the window; it reaches the controller at the next
+   *             expose, so the interleave commands can come in any order.
+   * @param[in]  args       "<height> <width>" in detector pixels, or empty to query
+   * @param[out] retstring  current window as "<height> <width>"
+   * @return     ERROR|NO_ERROR|HELP
+   *
+   */
+  long HispecTrackingCamera::interleave_science(const std::string &args, std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::interleave_science");
+
+    if (args=="?" || args=="help") {
+      retstring = "interleave_science [ <height> <width> ]\n";
+      retstring.append( "  Set or report the science window of the interleaved readout, in\n" );
+      retstring.append( "  detector pixels, centred on the detector like \"roi <height> <width>\".\n" );
+      retstring.append( "  <width> is split across two amplifiers, so it must be even; the\n" );
+      retstring.append( "  reference channel adds a third block of <width>/2 columns to each\n" );
+      retstring.append( "  line. <height> must be a whole multiple of interleave_set. Takes\n" );
+      retstring.append( "  effect at the next expose. With no argument, returns the current\n" );
+      retstring.append( "  window.\n" );
+      return HELP;
+    }
+
+    if (!args.empty()) {
+      std::vector<std::string> tokens;
+      Tokenize(args, tokens, " ");
+      if (tokens.size() != 2) {
+        return this->fail_detailed(function, retstring, "wrong argument count",
+                   "got "+std::to_string(tokens.size())+" argument(s) \""+args+
+                   "\"; expected <height> <width>");
+      }
+      const auto values = parse_ints(tokens);
+      if (!values) {
+        return this->fail_detailed(function, retstring, "arguments not numeric",
+                   "could not parse \""+args+"\" as two integers <height> <width>");
+      }
+      if (this->validate_roi(args, retstring) != NO_ERROR) return ERROR;
+
+      const int height = (*values)[0];
+      const int width  = (*values)[1];
+      if (width % INTERLEAVE_SCIENCE_AMPS != 0) {
+        return this->fail_detailed(function, retstring, "science width must be even",
+                   "width="+tokens[1]+" cannot be split evenly across "+
+                   std::to_string(INTERLEAVE_SCIENCE_AMPS)+" amplifiers");
+      }
+
+      this->interleave_geometry.science_rows           = height;
+      this->interleave_geometry.science_pixels_per_tap = width / INTERLEAVE_SCIENCE_AMPS;
+      this->interleave_geometry.science_start_row      = (this->detector_rows() - height) / 2;
+    }
+
+    retstring = std::to_string(this->interleave_geometry.science_rows) + " " +
+                std::to_string(this->interleave_geometry.science_pixels_per_tap * INTERLEAVE_SCIENCE_AMPS);
+    return NO_ERROR;
+  }
+  /***** Camera::HispecTrackingCamera::interleave_science ********************/
+
+  /***** Camera::HispecTrackingCamera::send_inreg_offstream ******************/
+  /**
+   * @brief      write a VCPU input register clear of the frame traffic
+   * @details    The primary connection is shared with the acquisition thread,
+   *             so a write there can fail in two ways while frames are moving.
+   *             A frame fetch in flight leaves the Archon busy, which is waited
+   *             out. Pushed autofetch frames bury the reply altogether, so then
+   *             the write goes over the control connection, which carries none.
+   * @param[in]  module  module number
+   * @param[in]  inreg   input register number
+   * @param[in]  value   register value
+   * @return     ERROR|NO_ERROR|BUSY
+   *
+   */
+  long HispecTrackingCamera::send_inreg_offstream(int module, int inreg, int value) {
+    if (!this->is_autofetch_mode) {
+      const auto deadline = std::chrono::steady_clock::now() + INREG_BUSY_WAIT;
+      long error = this->send_inreg(module, inreg, value);
+      while (error == BUSY && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(INREG_BUSY_POLL);
+        error = this->send_inreg(module, inreg, value);
+      }
+      return error;
+    }
+
+    const std::string key = "MOD" + std::to_string(module) + "/VCPU_INREG" + std::to_string(inreg);
+    const auto entry = this->controller->configmap.find(key);
+    if (entry == this->controller->configmap.end()) return ERROR;
+
+    // The same WCONFIG and APPLYDIO pair that set_vcpu_inreg() sends
+    std::ostringstream wconfig;
+    wconfig << "WCONFIG" << std::uppercase << std::setfill('0') << std::setw(4) << std::hex
+            << entry->second.line << key << "=" << std::to_string(value);
+    std::ostringstream applydio;
+    applydio << "APPLYDIO" << std::uppercase << std::setfill('0') << std::setw(2) << std::hex
+             << (module - 1);
+
+    long error = this->controller->send_control_cmd(wconfig.str());
+    // write_config_key() skips a value it believes the controller already holds
+    if (error == NO_ERROR) entry->second.value = std::to_string(value);
+    if (error == NO_ERROR) error = this->controller->send_control_cmd(applydio.str());
+    return error;
+  }
+  /***** Camera::HispecTrackingCamera::send_inreg_offstream ******************/
+
+  /***** Camera::HispecTrackingCamera::write_guide_window ********************/
+  /**
+   * @brief      write the H2RG window bound registers for the guide window
+   * @details    Sets where the window is and nothing else: the firmware decides
+   *             when the detector reads it. Stops at the first write that fails.
+   * @param[in]  vstart  first row, in detector pixels
+   * @param[in]  vstop   last row, inclusive
+   * @param[in]  hstart  first column
+   * @param[in]  hstop   last column, inclusive
+   * @return     ERROR|NO_ERROR|BUSY
+   *
+   */
+  long HispecTrackingCamera::write_guide_window(int vstart, int vstop, int hstart, int hstop) {
+    for (const int value : { H2RG_VSTART_REGISTER + vstart, H2RG_VSTOP_REGISTER + vstop,
+                             H2RG_HSTART_REGISTER + hstart, H2RG_HSTOP_REGISTER + hstop }) {
+      long error = this->send_inreg_offstream(this->lvds_module, VCPU_DATA_INREG, value);
+      if (error == NO_ERROR) error = this->send_inreg_offstream(this->lvds_module, VCPU_TRIGGER_INREG, 1);
+      if (error == NO_ERROR) error = this->send_inreg_offstream(this->lvds_module, VCPU_TRIGGER_INREG, 0);
+      if (error != NO_ERROR) return error;
+    }
+    return NO_ERROR;
+  }
+  /***** Camera::HispecTrackingCamera::write_guide_window ********************/
+
+  /***** Camera::HispecTrackingCamera::interleave_guide **********************/
+  /**
+   * @brief      set, move or report the guide window of the interleaved readout
+   * @details    Writes the same bound registers as "roi <vstart> <vstop>
+   *             <hstart> <hstop>" but not the window mode register: the
+   *             firmware switches the detector into window mode for each guide
+   *             read and back out for the science rows.
+   *
+   *             Safe to send while frames are being read, so the window can
+   *             follow a star during an exposure. The writes keep clear of the
+   *             frame traffic, one mover runs at a time, and a move that fails
+   *             part way puts the previous window back.
+   * @param[in]  args       "<vstart> <vstop> <hstart> <hstop>" in detector pixels, or empty to query
+   * @param[out] retstring  current window as "<vstart> <vstop> <hstart> <hstop>"
+   * @return     ERROR|NO_ERROR|HELP
+   *
+   */
+  long HispecTrackingCamera::interleave_guide(const std::string &args, std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::interleave_guide");
+
+    if (args=="?" || args=="help") {
+      retstring = "interleave_guide [ <vstart> <vstop> <hstart> <hstop> ]\n";
+      retstring.append( "  Set, move or report the guide window of the interleaved readout, in\n" );
+      retstring.append( "  detector pixels {0:2047} with inclusive bounds. Writes the same\n" );
+      retstring.append( "  detector registers as \"roi <vstart> <vstop> <hstart> <hstop>\" but\n" );
+      retstring.append( "  leaves the detector out of window mode; the firmware switches it\n" );
+      retstring.append( "  for each guide read. The window may sit anywhere on the detector.\n" );
+      retstring.append( "  Can be sent during an exposure to move the window; a move that\n" );
+      retstring.append( "  fails part way restores the previous window. Needs the detector\n" );
+      retstring.append( "  powered, and must be sent again after a power cycle, which clears\n" );
+      retstring.append( "  the detector's registers. Its width must fit in the science\n" );
+      retstring.append( "  window's columns per amplifier, which is checked at the next\n" );
+      retstring.append( "  expose. With no argument, returns the current window.\n" );
+      return HELP;
+    }
+
+    // One mover at a time: two register sequences interleaved on the wire
+    // would leave the detector holding parts of both windows
+    const std::lock_guard<std::mutex> lock(this->guide_window_mutex);
+    auto &geometry = this->interleave_geometry;
+
+    if (!args.empty()) {
+      std::vector<std::string> tokens;
+      Tokenize(args, tokens, " ");
+      if (tokens.size() != 4) {
+        return this->fail_detailed(function, retstring, "wrong argument count",
+                   "got "+std::to_string(tokens.size())+" argument(s) \""+args+
+                   "\"; expected <vstart> <vstop> <hstart> <hstop>");
+      }
+      const auto values = parse_ints(tokens);
+      if (!values) {
+        return this->fail_detailed(function, retstring, "arguments not numeric",
+                   "could not parse \""+args+"\" as four integers "
+                   "<vstart> <vstop> <hstart> <hstop>");
+      }
+      if (this->validate_roi(args, retstring) != NO_ERROR) return ERROR;
+
+      // Checked before anything is written: the Archon accepts these writes
+      // on behalf of a detector that cannot receive them
+      if (!this->controller->is_connected) {
+        return this->fail_detailed(function, retstring, "not connected",
+                   "no socket is open to the Archon; run \"open\" first");
+      }
+      if (!this->controller->is_firmwareloaded) {
+        return this->fail_detailed(function, retstring, "firmware not loaded",
+                   "the register writes go through the ACF's configuration; run "
+                   "\"load\" first");
+      }
+      if (!this->controller->is_powered) {
+        return this->fail_detailed(function, retstring, "power is off",
+                   "an unpowered detector does not hold its registers; run "
+                   "\"power on\", then send this command again");
+      }
+
+      const int vstart = (*values)[0];
+      const int vstop  = (*values)[1];
+      const int hstart = (*values)[2];
+      const int hstop  = (*values)[3];
+      if (this->write_guide_window(vstart, vstop, hstart, hstop) != NO_ERROR) {
+        // Put the old window back so the detector and this record still agree
+        const bool restored = geometry.has_guide_window() &&
+            this->write_guide_window(geometry.guide_vstart, geometry.guide_vstop,
+                                     geometry.guide_hstart, geometry.guide_hstop) == NO_ERROR;
+        return this->fail_detailed(function, retstring, "guide window not set",
+                   "a register write to LVDS module "+std::to_string(this->lvds_module)+
+                   " failed; "+(restored ? "the previous window was restored"
+                                         : "the detector may hold parts of both windows, "
+                                           "send the command again"));
+      }
+
+      geometry.guide_vstart = vstart;
+      geometry.guide_vstop  = vstop;
+      geometry.guide_hstart = hstart;
+      geometry.guide_hstop  = hstop;
+    }
+
+    retstring = std::to_string(geometry.guide_vstart) + " " +
+                std::to_string(geometry.guide_vstop) + " " +
+                std::to_string(geometry.guide_hstart) + " " +
+                std::to_string(geometry.guide_hstop);
+    return NO_ERROR;
+  }
+  /***** Camera::HispecTrackingCamera::interleave_guide **********************/
+
+  /***** Camera::HispecTrackingCamera::interleave_set ************************/
+  /**
+   * @brief      set or report the science rows read before each guide window
+   * @details    Only records the value; it reaches the controller at the next
+   *             expose, where it is checked against the science window height.
+   * @param[in]  args       "<rows>", or empty to query
+   * @param[out] retstring  current row count
+   * @return     ERROR|NO_ERROR|HELP
+   *
+   */
+  long HispecTrackingCamera::interleave_set(const std::string &args, std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::interleave_set");
+
+    if (args=="?" || args=="help") {
+      retstring = "interleave_set [ <rows> ]\n";
+      retstring.append( "  Set or report how many science rows the interleaved readout reads\n" );
+      retstring.append( "  before each guide window. Fewer rows give a faster guide cadence\n" );
+      retstring.append( "  and more guide frames per pass over the science window. The science\n" );
+      retstring.append( "  window height must be a whole multiple of it, which is checked at\n" );
+      retstring.append( "  the next expose. With no argument, returns the current value.\n" );
+      return HELP;
+    }
+
+    if (!args.empty()) {
+      const auto rows = parse_int(trim(args));
+      if (!rows || *rows < 1 || *rows > this->detector_rows()) {
+        return this->fail_detailed(function, retstring, "invalid row count",
+                   "\""+args+"\" must be an integer in {1:"+
+                   std::to_string(this->detector_rows())+"}");
+      }
+      this->interleave_geometry.rows_per_set = *rows;
+    }
+
+    retstring = std::to_string(this->interleave_geometry.rows_per_set);
+    return NO_ERROR;
+  }
+  /***** Camera::HispecTrackingCamera::interleave_set ************************/
 
 }

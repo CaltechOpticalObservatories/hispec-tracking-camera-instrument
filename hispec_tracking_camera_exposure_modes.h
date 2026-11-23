@@ -52,6 +52,37 @@ namespace Camera {
    */
   void place_current_thread(const char* name, const ThreadPlacement &placement);
 
+  /**
+   * @brief  windows and cadence of the interleaved readout
+   * @details  One Archon frame (a set) carries rows_per_set science lines
+   *           followed by a whole guide window. A pass is the run of sets that
+   *           covers the science window once.
+   */
+  struct InterleaveGeometry {
+    int science_start_row{0};        //!< first detector row of the science window
+    int science_rows{0};
+    int science_pixels_per_tap{0};   //!< also the Archon PIXELCOUNT; guide lines pad up to it
+    int guide_vstart{0};
+    int guide_vstop{0};
+    int guide_hstart{0};
+    int guide_hstop{0};
+    int rows_per_set{0};             //!< science rows read before each guide window
+
+    // False until a window is set: every bound still at zero reads as 1x1
+    bool has_guide_window() const { return guide_vstop > guide_vstart && guide_hstop > guide_hstart; }
+    int guide_rows() const { return guide_vstop - guide_vstart + 1; }
+    int guide_cols() const { return guide_hstop - guide_hstart + 1; }
+    int sets_per_pass() const { return rows_per_set > 0 ? science_rows / rows_per_set : 0; }
+    int lines_per_frame() const { return rows_per_set + guide_rows(); }
+  };
+
+  /** @brief  what the consumer publishes from each interleaved Archon frame */
+  enum class InterleaveOutput {
+    Raw,        //!< the Archon frame as read, science and guide lines together
+    Split,      //!< guide window per set, plus one assembled science image per pass
+    GuideOnly   //!< guide window per set and nothing else
+  };
+
   // Shared base: owns the frame queue and the consumer; subclasses implement
   // only the producer (image_acquisition_thread).
   class ExposureModeHispecTrackingBase : public ExposureModeTemplate<Camera::ArchonInterface> {

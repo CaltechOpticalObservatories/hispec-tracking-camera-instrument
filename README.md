@@ -54,11 +54,14 @@ Added to the base `camerad` command set:
 | Command | Purpose |
 |---|---|
 | `mode [<name>]` | Select or report the ACF camera mode (`[MODE_*]` section) |
-| `exposure [utr_rr\|utr_gr\|rx\|rxr]` | Select or report the H2RG readout mode |
+| `exposure [utr_rr\|utr_gr\|rx\|rxr\|interleave]` | Select or report the H2RG readout mode |
 | `autofetch_mode [true\|false]` | Have the controller stream frames as they are read |
 | `freerun 1\|0` | Arm or disarm continuous exposure; `abort` stops a running loop |
 | `roi [...]` | Set or report the region of interest |
 | `window_mode [true\|false]` | Enter or leave windowed (guiding) readout |
+| `interleave_science [<height> <width>]` | Set or report the interleaved readout's science window |
+| `interleave_guide [<vstart> <vstop> <hstart> <hstop>]` | Set or report the interleaved readout's guide window |
+| `interleave_set [<rows>]` | Set or report the science rows read before each guide window |
 | `debug [true\|false]` | Per-frame logging in the acquisition threads |
 | `take_stats [true\|false]` | Per-frame timing statistics |
 

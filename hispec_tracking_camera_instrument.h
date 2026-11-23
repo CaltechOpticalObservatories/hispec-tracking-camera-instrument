@@ -4,6 +4,7 @@
 #include "hispec_tracking_camera_exposure_modes.h"
 
 #include <atomic>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -60,6 +61,11 @@ namespace Camera {
       const std::string& reference_amp() const { return refpix_amp; }
       const std::string& readout_mode() const { return cur_exposure_mode; }
 
+      bool is_interleave() const { return cur_exposure_mode == "interleave"; }
+      const InterleaveGeometry& interleave() const { return interleave_geometry; }
+      InterleaveOutput interleave_output_mode() const { return interleave_output; }
+      bool writes_guide_fits() const { return is_guide_fits_enabled; }
+
       /** @brief  pixel time in force, from the ACF when it carries one */
       double effective_pixel_time_usec() const;
 
@@ -93,6 +99,12 @@ namespace Camera {
       long window_mode(const std::string &args, std::string &retstring);
       long guiding_roi(const std::string &args, std::string &retstring);
 
+      // Interleaved readout: science rows alternating with a guide window
+      long interleave_science(const std::string &args, std::string &retstring);
+      long interleave_guide(const std::string &args, std::string &retstring);
+      long interleave_set(const std::string &args, std::string &retstring);
+      long write_guide_window(int vstart, int vstop, int hstart, int hstop);
+
       long freerun(const std::string &args, std::string &retstring);
       long _debug(const std::string &args, std::string &retstring);
       long _take_stats(const std::string &args, std::string &retstring);
@@ -111,6 +123,9 @@ namespace Camera {
       long send_inreg(int module, int inreg, int value);
       long send_inreg_clocked(int module, int inreg, int value);
 
+      // The same write, kept clear of frames arriving on the primary connection
+      long send_inreg_offstream(int module, int inreg, int value);
+
       // Window mode state
       bool is_window{false};
       int win_vstart{0};
@@ -120,6 +135,11 @@ namespace Camera {
       int taplines_store{0};
       std::string tapline0_store;
       std::string cur_exposure_mode;
+
+      InterleaveGeometry interleave_geometry;
+      std::mutex guide_window_mutex;   //!< one guide window move at a time
+      InterleaveOutput interleave_output{InterleaveOutput::Raw};
+      bool is_guide_fits_enabled{false};
 
       // Set in configure_instrument()
       int lvds_module{0};
