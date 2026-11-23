@@ -57,19 +57,20 @@ namespace Camera {
    * @details  One Archon frame (a set) carries rows_per_set science lines
    *           followed by a whole guide window. A pass is the run of sets that
    *           covers the science window once.
+   *
+   *           Starts as a 128x128 science window centred on the detector, read
+   *           four rows at a time, with a 10x10 guide window at its centre.
    */
   struct InterleaveGeometry {
-    int science_start_row{0};        //!< first detector row of the science window
-    int science_rows{0};
-    int science_pixels_per_tap{0};   //!< also the Archon PIXELCOUNT; guide lines pad up to it
-    int guide_vstart{0};
-    int guide_vstop{0};
-    int guide_hstart{0};
-    int guide_hstop{0};
-    int rows_per_set{0};             //!< science rows read before each guide window
+    int science_start_row{960};      //!< first detector row of the science window
+    int science_rows{128};
+    int science_pixels_per_tap{64};  //!< also the Archon PIXELCOUNT; guide lines pad up to it
+    int guide_vstart{1019};
+    int guide_vstop{1028};
+    int guide_hstart{1019};
+    int guide_hstop{1028};
+    int rows_per_set{4};             //!< science rows read before each guide window
 
-    // False until a window is set: every bound still at zero reads as 1x1
-    bool has_guide_window() const { return guide_vstop > guide_vstart && guide_hstop > guide_hstart; }
     int guide_rows() const { return guide_vstop - guide_vstart + 1; }
     int guide_cols() const { return guide_hstop - guide_hstart + 1; }
     int sets_per_pass() const { return rows_per_set > 0 ? science_rows / rows_per_set : 0; }
@@ -141,6 +142,10 @@ namespace Camera {
       // since the producer hands it to prep_parameter(), which throws when it is
       // out of range, and a throw leaving a thread terminates the process.
       std::atomic<int> nseq{1};
+
+      // Frames each unit of that trigger count yields. One, except for an
+      // interleaved pass, which is a single trigger and a frame per set.
+      std::atomic<int> frames_per_trigger{1};
 
       // Frames the producer actually queued, so a failure can report how far
       // the sequence got rather than only that it stopped

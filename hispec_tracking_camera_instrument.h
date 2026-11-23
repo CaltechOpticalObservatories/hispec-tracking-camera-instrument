@@ -66,6 +66,15 @@ namespace Camera {
       InterleaveOutput interleave_output_mode() const { return interleave_output; }
       bool writes_guide_fits() const { return is_guide_fits_enabled; }
 
+      /**
+       * @brief      point the sequencer at the start of the science window
+       * @details    A pass leaves H2RG_rows_skip at the window's last row and
+       *             interleave_nsets at zero, so both are rewritten before
+       *             every trigger.
+       * @return     ERROR|NO_ERROR
+       */
+      long arm_interleave_pass();
+
       /** @brief  pixel time in force, from the ACF when it carries one */
       double effective_pixel_time_usec() const;
 
@@ -105,6 +114,14 @@ namespace Camera {
       long interleave_set(const std::string &args, std::string &retstring);
       long write_guide_window(int vstart, int vstop, int hstart, int hstop);
 
+      // Send what the interleave commands recorded to the controller, ahead of a trigger
+      long apply_interleave(std::string &retstring);
+
+      // The geometry an interleaved exposure started with has to hold until it ends
+      bool is_interleave_frozen() const {
+        return is_interleave() && (exposes_in_progress.load() > 0 || is_freerun_active.load());
+      }
+
       long freerun(const std::string &args, std::string &retstring);
       long _debug(const std::string &args, std::string &retstring);
       long _take_stats(const std::string &args, std::string &retstring);
@@ -137,7 +154,10 @@ namespace Camera {
       std::string cur_exposure_mode;
 
       InterleaveGeometry interleave_geometry;
-      std::mutex guide_window_mutex;   //!< one guide window move at a time
+      // Guards interleave_geometry, and is held across the register writes of a
+      // guide window move so that two moves cannot mix on the wire
+      std::mutex interleave_mutex;
+      std::atomic<int> exposes_in_progress{0};   //!< expose() calls that have not yet returned
       InterleaveOutput interleave_output{InterleaveOutput::Raw};
       bool is_guide_fits_enabled{false};
 

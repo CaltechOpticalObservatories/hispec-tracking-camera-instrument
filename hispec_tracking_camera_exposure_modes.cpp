@@ -863,6 +863,7 @@ namespace Camera {
     this->header_set = build_header_set(false, freerun);
 
     const int nseq = this->nseq.load();
+    const long long frames_wanted = static_cast<long long>(nseq) * this->frames_per_trigger.load();
 
     auto* mode = &controller->modemap[controller->selectedmode];
     const int num_detect = mode->geometry.num_detect;
@@ -901,7 +902,7 @@ namespace Camera {
     this->frames_dropped.store(0);
     int consecutive_errors = 0;  //!< reset by every good frame; see MAX_CONSECUTIVE_ERRORS
 
-    for (long long i = 0; freerun || i < nseq; ++i) {
+    for (long long i = 0; freerun || i < frames_wanted; ++i) {
       if (this->interface->is_aborted()) break;
       const long long dropped_before = this->frames_dropped.load();
       if (this->wait_for_frame(baseline, i == 0) != NO_ERROR) {
@@ -949,7 +950,7 @@ namespace Camera {
       catch (const std::exception &ex) {
         hispec->log_error(function, "out of memory",
                    "could not allocate "+std::to_string(nbytes)+" bytes for frame "+
-                   std::to_string(i+1)+" of "+std::to_string(nseq)+": "+ex.what());
+                   std::to_string(i+1)+" of "+std::to_string(frames_wanted)+": "+ex.what());
         this->is_producer_error = true;
         break;
       }
@@ -983,7 +984,7 @@ namespace Camera {
              ? "freerun acquisition stopped after " + std::to_string(frames_read) +
                " frames, " + std::to_string(this->frames_dropped.load()) + " dropped"
              : "sequence complete: " + std::to_string(frames_read) + " of " +
-               std::to_string(nseq) + " frames, " +
+               std::to_string(frames_wanted) + " frames, " +
                std::to_string(this->frames_dropped.load()) + " dropped");
   }
   /***** Camera::ExposureModeHispecTrackingDefault::image_acquisition_thread */

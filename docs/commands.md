@@ -50,6 +50,10 @@ argument and prints its usage with `?` or `help`, and they can be given in any o
 | `interleave_guide <vstart> <vstop> <hstart> <hstop>` | The guide window, with the same inclusive bounds as the explicit `roi` form |
 | `interleave_set <rows>` | Science rows read before each guide window, `1` to `2048` |
 
+They start as a 128 by 128 science window, `interleave_set 4` and a 10 by 10 guide window at the
+centre of the detector (`1019 1028 1019 1028`), so `exposure interleave` followed by `expose` works
+without setting any of them.
+
 `<width>` is split across two amplifiers, so it must be even. The reference channel adds a third
 block of `<width>/2` columns to every line, so a 128 by 128 window is stored 192 columns wide.
 
@@ -59,9 +63,11 @@ switches into window mode for each guide read and back out for the science rows.
 may sit anywhere on the detector, inside the science window or not.
 
 It needs the controller connected, firmware loaded and the detector powered, and is refused
-otherwise. A power cycle clears the detector's registers, so send it again after `power on`.
+otherwise. A power cycle clears the detector's registers, so every `expose` in the `interleave`
+readout mode writes the window again.
 
-It can be sent while an exposure is running, to move the window as the guide star drifts:
+It can be sent while an exposure is running, to move the window as the guide star drifts, though
+not to resize it:
 
 - The register writes keep clear of the frame data. They wait out a frame fetch on the shared
   connection, and go over the controller's control connection while autofetch is armed.
@@ -72,7 +78,31 @@ It can be sent while an exposure is running, to move the window as the guide sta
 A guide frame being read out while the window moves can hold rows from both positions.
 
 `interleave_science` and `interleave_set` only record their values, which are sent to the
-controller at the next `expose`.
+controller at the next `expose`. Neither can be changed while an interleaved exposure or freerun
+session is running.
+
+### At expose
+
+In the `interleave` readout mode, `expose` first checks the three settings against each other and
+refuses to start if:
+
+- the science height is not a whole multiple of `interleave_set`
+- the guide window is wider than the `<width>/2` columns each amplifier reads per line
+- no camera mode is selected, since the frame is laid out across its taplines
+
+It then sends them to the controller and sets the frame geometry. One Archon frame holds one set:
+`interleave_set` science lines followed by the guide window's lines, each `<width>/2` pixels per
+tap. With a 128 by 128 science window, `interleave_set 4` and a 10 by 10 guide window, a frame is
+192 by 14 and a pass over the science window is 32 frames.
+
+`expose <n>` runs `n` passes. Each pass is one trigger, and every frame of it is written as read,
+science lines and guide lines together. Between passes the sequencer is pointed back at the start
+of the science window. This is on the polled pipeline; freerun and autofetch do not yet loop over
+passes.
+
+The sets of a pass follow each other as fast as the detector reads them unless `exptime` is set,
+which adds that delay after every set. With no delay the polled pipeline cannot fetch each frame
+before the controller overwrites it, and `expose` reports how many were dropped.
 
 None of these commands changes the window `roi` reports.
 
