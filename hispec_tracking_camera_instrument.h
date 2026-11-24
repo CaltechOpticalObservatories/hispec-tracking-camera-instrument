@@ -3,8 +3,11 @@
 #include "archon_interface.h"
 #include "hispec_tracking_camera_exposure_modes.h"
 
+#include <array>
 #include <atomic>
+#include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -129,6 +132,27 @@ namespace Camera {
         return is_interleave() && (exposes_in_progress.load() > 0 || is_freerun_active.load());
       }
 
+      /** H2RG_columns and H2RG_rows_skip, which the detector reads and the host cannot read back */
+      struct H2rgWindow {
+        int columns{0};
+        int rows_skip{0};
+      };
+
+      /** What apply_interleave() overwrites, kept so that leaving the readout can put it back */
+      struct SavedReadout {
+        std::string camera_mode;
+        int pixelcount{0};
+        int linecount{0};
+        std::optional<H2rgWindow> h2rg_window;
+        std::array<uint32_t, 4> region_of_interest{};
+        std::array<uint32_t, 2> detector_pixels{};
+      };
+
+      void record_h2rg_window(int columns, int rows_skip);
+      void discard_pre_interleave_readout();
+      std::optional<H2rgWindow> current_h2rg_window() const;
+      long restore_pre_interleave_readout(std::string &retstring);
+
       long freerun(const std::string &args, std::string &retstring);
       long _debug(const std::string &args, std::string &retstring);
       long _take_stats(const std::string &args, std::string &retstring);
@@ -169,6 +193,11 @@ namespace Camera {
       mutable std::mutex guide_position_mutex;
       std::atomic<uint64_t> guide_changes{0};   //!< see GuidePosition::changes
       std::atomic<int> exposes_in_progress{0};   //!< expose() calls that have not yet returned
+      // Both guarded by interleave_mutex. h2rg_window is empty until a command
+      // writes it; pre_interleave_readout is held from the first interleaved
+      // exposure until the readout is switched away or a new geometry is set.
+      std::optional<H2rgWindow> h2rg_window;
+      std::optional<SavedReadout> pre_interleave_readout;
       InterleaveOutput interleave_output{InterleaveOutput::Raw};
       bool is_guide_fits_enabled{false};
 

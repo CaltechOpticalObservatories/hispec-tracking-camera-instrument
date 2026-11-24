@@ -112,6 +112,16 @@ before the controller overwrites it, and `expose` reports how many were dropped.
 
 None of these commands changes the window `roi` reports.
 
+### Leaving the interleaved readout
+
+Selecting another readout with `exposure` puts back the frame geometry from before the first
+interleaved exposure: `H2RG_columns`, `H2RG_rows_skip`, `PIXELCOUNT`, `LINECOUNT` and the region of
+interest. The next `rx` frame is then the same shape as one taken before the interleaved readout.
+It is refused with `exposure in progress` while an interleaved exposure or freerun session runs.
+
+A `roi`, `mode`, `fullframe` or `window_mode` given in the meantime sets its own geometry, and that
+is what the next readout keeps.
+
 ## Error reporting
 
 A failing command returns a short reason. The log gets the root cause and a one-line snapshot of

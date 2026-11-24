@@ -66,6 +66,8 @@ namespace Camera {
     // channel rides along on a third
     constexpr int INTERLEAVE_SCIENCE_AMPS = 2;
 
+    constexpr std::string_view INTERLEAVE_READOUT = "interleave";
+
     constexpr int H2RG_BITS_PER_PIXEL = 16;
 
     std::optional<double> positive_ticks(const std::string &text) {
@@ -405,6 +407,12 @@ namespace Camera {
   long HispecTrackingCamera::load_firmware(const std::string &args, std::string &retstring) {
     long error = this->ArchonInterface::load_firmware(args, retstring);
     if (error != NO_ERROR) return error;
+    {
+      // A load puts the ACF's geometry and parameters back, so nothing saved still applies
+      const std::lock_guard<std::mutex> lock(this->interleave_mutex);
+      this->h2rg_window.reset();
+      this->pre_interleave_readout.reset();
+    }
     return this->set_exposure_mode(HispecTrackingCameraExposureMode::DEFAULT, {});
   }
   /***** Camera::HispecTrackingCamera::load_firmware *************************/
@@ -1094,6 +1102,7 @@ namespace Camera {
     // name, loads the mode's parameters and geometry from the ACF, and applies
     // them (with its own APPLYCDS when the geometry changes). On success it sets
     // controller->selectedmode to the canonical modemap key.
+    this->discard_pre_interleave_readout();
     long error = this->ArchonInterface::acfmode(args, retstring);
     if (error != NO_ERROR) {
       return this->fail_detailed(function, retstring, "camera mode not set",
@@ -1146,6 +1155,7 @@ namespace Camera {
                  std::to_string(rows)+"); check H2RG_rows, H2RG_columns and "
                  "H2RG_rows_skip exist in the ACF");
     }
+    this->record_h2rg_window(columns, 0);
 
     // mode.tapinfo (num_taps, ampname, readoutdir, gain, offset) is already
     // populated for every mode at ACF-load time (ArchonController::parse_tapinfo),
@@ -1193,6 +1203,16 @@ namespace Camera {
     }
     const std::string &mode_name = req_param->first;
     const std::string &mode_value = req_param->second;
+
+    // The interleaved readout reshapes the frame; the next readout needs the shape from before it
+    if (this->is_interleave() && mode_name != INTERLEAVE_READOUT) {
+      if (this->is_interleave_frozen()) {
+        return this->fail_detailed(function, retstring, "exposure in progress",
+                   "the interleaved readout cannot be left while an exposure or freerun "
+                   "session runs; abort it or wait for it to finish");
+      }
+      if (this->restore_pre_interleave_readout(retstring) != NO_ERROR) return ERROR;
+    }
 
     // iterate through the arguments and set param to 0
     for (const auto &[key, value] : _exposure_modes) {
@@ -1321,6 +1341,7 @@ namespace Camera {
     this->set_parameter("H2RG_columns " + std::to_string(cols), dummy);
     this->set_parameter("H2RG_rows " + std::to_string(rows), dummy);
     this->set_parameter("H2RG_rows_skip " + std::to_string(vstart), dummy);
+    this->record_h2rg_window(cols, vstart);
 
     //Check mode and set cds variables
     // Update CDS geometry via config keys
@@ -1426,6 +1447,7 @@ namespace Camera {
       this->set_parameter("H2RG_columns " + std::to_string(cols), dummy);
       this->set_parameter("H2RG_rows " + std::to_string(rows), dummy);
       this->set_parameter("H2RG_rows_skip 0", dummy);
+      this->record_h2rg_window(cols, 0);
 
       // Update CDS geometry via config keys
       bool changed = false;
@@ -1499,6 +1521,7 @@ namespace Camera {
     this->set_parameter("H2RG_columns " + std::to_string(cols), dummy);
     this->set_parameter("H2RG_rows " + std::to_string(rows), dummy);
     this->set_parameter("H2RG_rows_skip " + std::to_string(vstart), dummy);
+    this->record_h2rg_window(cols, vstart);
 
     // take detector out of window mode: // 0111 000000001100
     if (this->is_window) {
@@ -1631,6 +1654,7 @@ namespace Camera {
       std::transform(state.begin(), state.end(), state.begin(), ::toupper);
 
       if (state == "FALSE" || state == "0") {
+        this->discard_pre_interleave_readout();
         this->is_window = false;
 
         // Set detector out of window mode: 0111 000000001100 = 28684
@@ -1666,6 +1690,7 @@ namespace Camera {
         if (error == NO_ERROR) logwrite(function, "window mode disabled");
       }
       else if (state == "TRUE" || state == "1") {
+        this->discard_pre_interleave_readout();
         this->is_window = true;
 
         // Set detector into window mode: 0111 000000001111 = 28687
@@ -2109,6 +2134,14 @@ namespace Camera {
     }
     auto &mode = selected->second;
 
+    // Only the first exposure saves: later ones would save the interleaved geometry itself
+    if (!this->pre_interleave_readout) {
+      this->pre_interleave_readout = SavedReadout{
+        this->controller->selectedmode, mode.geometry.pixelcount, mode.geometry.linecount,
+        this->current_h2rg_window(), this->camera_info.region_of_interest,
+        this->camera_info.detector_pixels};
+    }
+
     const int pixelcount = geometry.science_pixels_per_tap;
     const int linecount  = geometry.lines_per_frame();
 
@@ -2194,5 +2227,139 @@ namespace Camera {
     return error;
   }
   /***** Camera::HispecTrackingCamera::arm_interleave_pass ********************/
+
+
+  /***** Camera::HispecTrackingCamera::record_h2rg_window *********************/
+  /**
+   * @brief      note the H2RG window a command has just written
+   * @details    Called before that command sets its geometry, which supersedes
+   *             any saved before an interleaved exposure.
+   *
+   */
+  void HispecTrackingCamera::record_h2rg_window(int columns, int rows_skip) {
+    this->discard_pre_interleave_readout();
+    const std::lock_guard<std::mutex> lock(this->interleave_mutex);
+    this->h2rg_window = H2rgWindow{columns, rows_skip};
+  }
+  /***** Camera::HispecTrackingCamera::record_h2rg_window *********************/
+
+
+  /***** Camera::HispecTrackingCamera::discard_pre_interleave_readout *********/
+  /**
+   * @brief      drop the saved geometry for a command that sets its own
+   * @details    The camera mode's stored geometry is still put back: commands
+   *             such as mode read it, and would otherwise push the interleaved
+   *             frame shape. Call before the command sets its geometry.
+   *
+   */
+  void HispecTrackingCamera::discard_pre_interleave_readout() {
+    const std::lock_guard<std::mutex> lock(this->interleave_mutex);
+    if (!this->pre_interleave_readout) return;
+    const SavedReadout &saved = *this->pre_interleave_readout;
+    const auto mode = this->controller->modemap.find(saved.camera_mode);
+    if (mode != this->controller->modemap.end()) {
+      mode->second.geometry.pixelcount = saved.pixelcount;
+      mode->second.geometry.linecount  = saved.linecount;
+    }
+    this->pre_interleave_readout.reset();
+  }
+  /***** Camera::HispecTrackingCamera::discard_pre_interleave_readout *********/
+
+
+  /***** Camera::HispecTrackingCamera::current_h2rg_window ********************/
+  /**
+   * @brief      the H2RG window the detector is set to read, if known
+   * @details    Caller holds interleave_mutex. Before any command has written
+   *             the window, the controller still holds the ACF's values.
+   *
+   */
+  std::optional<HispecTrackingCamera::H2rgWindow> HispecTrackingCamera::current_h2rg_window() const {
+    if (this->h2rg_window) return this->h2rg_window;
+
+    const auto acf_value = [this](const std::string &name) -> std::optional<int> {
+      const auto param = this->controller->parammap.find(name);
+      if (param == this->controller->parammap.end()) return std::nullopt;
+      const std::string &text = param->second.value;
+      int value = 0;
+      const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+      if (error != std::errc{} || end != text.data() + text.size()) return std::nullopt;
+      return value;
+    };
+    const auto columns   = acf_value("H2RG_columns");
+    const auto rows_skip = acf_value("H2RG_rows_skip");
+    if (!columns || !rows_skip) return std::nullopt;
+    return H2rgWindow{*columns, *rows_skip};
+  }
+  /***** Camera::HispecTrackingCamera::current_h2rg_window ********************/
+
+
+  /***** Camera::HispecTrackingCamera::restore_pre_interleave_readout *********/
+  /**
+   * @brief      put back what apply_interleave() overwrote
+   * @details    On failure the saved geometry is kept, so leaving the readout
+   *             can be tried again.
+   * @param[out] retstring  reason on failure
+   * @return     ERROR|NO_ERROR
+   *
+   */
+  long HispecTrackingCamera::restore_pre_interleave_readout(std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::restore_pre_interleave_readout");
+    const std::lock_guard<std::mutex> lock(this->interleave_mutex);
+    if (!this->pre_interleave_readout) return NO_ERROR;
+    const SavedReadout &saved = *this->pre_interleave_readout;
+
+    const auto mode = this->controller->modemap.find(saved.camera_mode);
+    if (mode == this->controller->modemap.end()) {
+      this->pre_interleave_readout.reset();
+      logwrite(function, "WARNING camera mode "+saved.camera_mode+" is gone, so its "
+                         "geometry was not restored; run mode or roi before the next exposure");
+      return NO_ERROR;
+    }
+    mode->second.geometry.pixelcount = saved.pixelcount;
+    mode->second.geometry.linecount  = saved.linecount;
+
+    // A mode switch that failed part way leaves another mode selected, whose
+    // geometry the controller is not using the saved values for
+    if (saved.camera_mode != this->controller->selectedmode) {
+      this->pre_interleave_readout.reset();
+      logwrite(function, "WARNING camera mode changed from "+saved.camera_mode+" to "+
+                         this->controller->selectedmode+" since the interleaved exposure; "
+                         "only the modemap geometry was restored");
+      return NO_ERROR;
+    }
+
+    if (saved.h2rg_window) {
+      if (this->set_parameter_offstream("H2RG_columns", saved.h2rg_window->columns)     != NO_ERROR ||
+          this->set_parameter_offstream("H2RG_rows_skip", saved.h2rg_window->rows_skip) != NO_ERROR) {
+        return this->fail_detailed(function, retstring, "readout geometry not restored",
+                   "the controller rejected H2RG_columns or H2RG_rows_skip");
+      }
+    }
+    else {
+      logwrite(function, "WARNING H2RG_columns and H2RG_rows_skip were never written and the "
+                         "ACF has no value for them, so they were not restored; run mode or roi "
+                         "before the next exposure");
+    }
+
+    bool changed = false;
+    long error = this->controller->write_config_key("PIXELCOUNT", saved.pixelcount, changed);
+    if (error == NO_ERROR) error = this->controller->write_config_key("LINECOUNT", saved.linecount, changed);
+    if (error == NO_ERROR && changed) error = this->controller->send_cmd(APPLYCDS);
+    if (error != NO_ERROR) {
+      return this->fail_detailed(function, retstring, "readout geometry not restored",
+                 "the controller rejected the CDS geometry "+std::to_string(saved.pixelcount)+"x"+
+                 std::to_string(saved.linecount)+" (PIXELCOUNT x LINECOUNT)");
+    }
+
+    this->camera_info.region_of_interest = saved.region_of_interest;
+    this->camera_info.detector_pixels    = saved.detector_pixels;
+    this->camera_info.set_axes(H2RG_BITS_PER_PIXEL);
+
+    logwrite(function, "restored "+saved.camera_mode+" geometry "+std::to_string(saved.pixelcount)+"x"+
+                       std::to_string(saved.linecount)+" after the interleaved readout");
+    this->pre_interleave_readout.reset();
+    return NO_ERROR;
+  }
+  /***** Camera::HispecTrackingCamera::restore_pre_interleave_readout *********/
 
 }
