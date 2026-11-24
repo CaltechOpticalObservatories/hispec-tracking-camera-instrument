@@ -88,8 +88,7 @@ refuses to start if:
 
 - the science height is not a whole multiple of `interleave_set`
 - the guide window is wider than the `<width>/2` columns each amplifier reads per line. A narrower
-  one is accepted with a warning in the log: it needs a sequencer that clocks every guide line out
-  to that width, and without one no frame completes and `expose` times out
+  one is fine: the sequencer clocks every guide line out to the full width
 - no camera mode is selected, since the frame is laid out across its taplines
 
 It then clears any abort left set in the controller, sends the settings and sets the frame

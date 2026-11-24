@@ -2145,15 +2145,6 @@ namespace Camera {
     const int pixelcount = geometry.science_pixels_per_tap;
     const int linecount  = geometry.lines_per_frame();
 
-    // Allowed, since a sequencer that pads its guide lines handles it, but with
-    // one that does not the controller never sees a frame end
-    if (geometry.guide_cols() < pixelcount) {
-      logwrite(function, "WARNING guide lines are "+std::to_string(geometry.guide_cols())+
-                         " pixels wide and the frame is "+std::to_string(pixelcount)+" per tap: "
-                         "unless the sequencer clocks every guide line out to that width, no "
-                         "frame completes and the exposure times out");
-    }
-
     // An abort sent while the sequencer was idle stays set in the controller,
     // and would end this exposure after its first set
     if (!this->controller->abort_param.empty() &&
