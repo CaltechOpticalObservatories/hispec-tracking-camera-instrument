@@ -95,6 +95,15 @@ namespace Camera {
       return value;
     }
 
+    // A misspelt value fails startup, where the alternative is to publish
+    // something other than what the .cfg asked for without saying so
+    InterleaveOutput parse_interleave_output(const std::string &arg) {
+      if (arg == "raw")   return InterleaveOutput::Raw;
+      if (arg == "split") return InterleaveOutput::Split;
+      if (arg == "guide") return InterleaveOutput::GuideOnly;
+      throw std::runtime_error("INTERLEAVE_OUTPUT="+arg+": expected raw, split or guide");
+    }
+
     // All or nothing. Run ahead of validate_roi(), whose std::stoi reads "12x"
     // as 12 and throws on a value too large for an int, which nothing catches.
     std::optional<std::vector<int>> parse_ints(const std::vector<std::string> &tokens) {
@@ -294,6 +303,16 @@ namespace Camera {
                                                         : this->processing_thread_placement;
         placement = parse_placement(param, arg);
         logwrite(function, param + ": " + describe_placement(placement));
+        continue;
+      }
+      if (param=="INTERLEAVE_OUTPUT") {
+        this->interleave_output = parse_interleave_output(arg);
+        logwrite(function, param + ": " + arg);
+        continue;
+      }
+      if (param=="INTERLEAVE_GUIDE_FITS") {
+        this->is_guide_fits_enabled = parse_bool(arg);
+        logwrite(function, param + ": " + (this->is_guide_fits_enabled ? "yes" : "no"));
         continue;
       }
       try {
@@ -766,36 +785,19 @@ namespace Camera {
       logwrite(function, "readout deadline "+std::to_string(timeout_msec)+" msec per frame");
     }
 
-    // An interleaved pass is a single trigger that yields a frame per set, and
-    // it leaves the sequencer needing to be re-armed before the next one
-    const bool interleaved  = this->is_interleave();
-    const int passes        = interleaved ? nseq : 1;
-    const int frames_a_pass = interleaved ? this->interleave_geometry.sets_per_pass() : nseq;
-    const long long frames_wanted = static_cast<long long>(passes) * frames_a_pass;
+    // In the interleave readout the count is passes, each one a frame per set
+    const long long frames_wanted = this->is_interleave()
+        ? static_cast<long long>(nseq) * this->interleave_geometry.sets_per_pass() : nseq;
 
-    mode->nseq.store(interleaved ? 1 : nseq);
-    mode->frames_per_trigger.store(interleaved ? frames_a_pass : 1);
+    mode->nseq.store(nseq);
     mode->is_freerun.store(false);  // do_expose() joins the producer, so it must terminate
 
-    long error = NO_ERROR;
-    long long got = 0;
-    long long dropped = 0;
-    for (int pass = 0; pass < passes && error == NO_ERROR; ++pass) {
-      // apply_interleave() armed the first pass
-      if (pass > 0 && this->arm_interleave_pass() != NO_ERROR) {
-        this->end_exposure();
-        return this->fail_detailed(function, retstring, "pass not armed",
-                   "the controller rejected H2RG_rows_skip or interleave_nsets ahead of pass "+
-                   std::to_string(pass+1)+" of "+std::to_string(passes));
-      }
-      error = this->do_expose();
-      got     += mode->frames_acquired.load();
-      dropped += mode->frames_dropped.load();
-    }
+    const long error = this->do_expose();
 
     this->end_exposure();           // finalize the datacube, if one is open
 
     if (error != NO_ERROR) {
+      const long long got = mode->frames_acquired.load();
       std::string cause = "the acquisition thread stopped";
       if (mode->is_consumer_error) cause = "the processing thread stopped";
       else if (!mode->is_producer_error) cause = "neither thread flagged an error, so the stage is unknown";
@@ -806,7 +808,7 @@ namespace Camera {
     }
 
     // The frames that did arrive are written; the caller still has to know the sequence has gaps
-    if (dropped > 0) {
+    if (const long long dropped = mode->frames_dropped.load(); dropped > 0) {
       return this->fail_detailed(function, retstring, "frames dropped",
                                  std::to_string(dropped)+" of "+std::to_string(frames_wanted)+
                                  " frame(s) were overwritten before the host fetched them; "
@@ -1969,6 +1971,14 @@ namespace Camera {
                    "exposure has finished");
       }
 
+      // Odd from here until the registers settle, so a frame read out meanwhile
+      // can be told apart from the ones around it
+      ++this->guide_changes;
+      struct MoveFinished {
+        std::atomic<uint64_t> &changes;
+        ~MoveFinished() { ++changes; }
+      } finished{this->guide_changes};
+
       if (this->write_guide_window(vstart, vstop, hstart, hstop) != NO_ERROR) {
         // Put the old window back so the detector and this record still agree
         const bool restored =
@@ -1981,6 +1991,7 @@ namespace Camera {
                                            "send the command again"));
       }
 
+      const std::lock_guard<std::mutex> published(this->guide_position_mutex);
       geometry.guide_vstart = vstart;
       geometry.guide_vstop  = vstop;
       geometry.guide_hstart = hstart;
@@ -1994,6 +2005,20 @@ namespace Camera {
     return NO_ERROR;
   }
   /***** Camera::HispecTrackingCamera::interleave_guide **********************/
+
+  /***** Camera::HispecTrackingCamera::guide_position ************************/
+  /**
+   * @brief      where the guide window is now, and whether it is moving
+   * @return     the window's bounds and its change count
+   *
+   */
+  GuidePosition HispecTrackingCamera::guide_position() const {
+    const std::lock_guard<std::mutex> lock(this->guide_position_mutex);
+    const auto &geometry = this->interleave_geometry;
+    return { geometry.guide_vstart, geometry.guide_vstop, geometry.guide_hstart,
+             geometry.guide_hstop, this->guide_changes.load() };
+  }
+  /***** Camera::HispecTrackingCamera::guide_position ************************/
 
   /***** Camera::HispecTrackingCamera::interleave_set ************************/
   /**
@@ -2087,6 +2112,24 @@ namespace Camera {
     const int pixelcount = geometry.science_pixels_per_tap;
     const int linecount  = geometry.lines_per_frame();
 
+    // Allowed, since a sequencer that pads its guide lines handles it, but with
+    // one that does not the controller never sees a frame end
+    if (geometry.guide_cols() < pixelcount) {
+      logwrite(function, "WARNING guide lines are "+std::to_string(geometry.guide_cols())+
+                         " pixels wide and the frame is "+std::to_string(pixelcount)+" per tap: "
+                         "unless the sequencer clocks every guide line out to that width, no "
+                         "frame completes and the exposure times out");
+    }
+
+    // An abort sent while the sequencer was idle stays set in the controller,
+    // and would end this exposure after its first set
+    if (!this->controller->abort_param.empty() &&
+        this->set_parameter_offstream(this->controller->abort_param, 0) != NO_ERROR) {
+      return this->fail_detailed(function, retstring, "interleave not applied",
+                 "the controller rejected "+this->controller->abort_param+"=0; ABORT_PARAM "
+                 "in the .cfg must match the ACF parameter name exactly");
+    }
+
     if (this->set_parameter_offstream("H2RG_columns", pixelcount)               != NO_ERROR ||
         this->set_parameter_offstream("interleave_set", geometry.rows_per_set)  != NO_ERROR ||
         this->set_parameter_offstream("interleave_rows", geometry.guide_rows()) != NO_ERROR ||
@@ -2125,12 +2168,6 @@ namespace Camera {
                  " failed, so the detector may not hold the guide window");
     }
 
-    if (this->arm_interleave_pass() != NO_ERROR) {
-      return this->fail_detailed(function, retstring, "interleave not applied",
-                 "the controller rejected H2RG_rows_skip or interleave_nsets; check "
-                 "that both exist in the loaded ACF");
-    }
-
     logwrite(function, "science "+std::to_string(geometry.science_rows)+" rows from row "+
                        std::to_string(geometry.science_start_row)+", "+
                        std::to_string(geometry.rows_per_set)+" per set, "+
@@ -2144,9 +2181,9 @@ namespace Camera {
   /***** Camera::HispecTrackingCamera::arm_interleave_pass ********************/
   /**
    * @brief      point the sequencer at the start of the science window
-   * @details    Reads only settings that are frozen while an exposure runs,
-   *             so it takes no lock and the acquisition thread can call it
-   *             between passes without waiting on a guide window move.
+   * @details    Called by the acquisition thread ahead of every trigger. Reads
+   *             only settings that are frozen while an exposure runs, so it
+   *             takes no lock and never waits on a guide window move.
    * @return     ERROR|NO_ERROR
    *
    */

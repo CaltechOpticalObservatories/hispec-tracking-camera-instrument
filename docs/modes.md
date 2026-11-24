@@ -41,6 +41,12 @@ How `expose` behaves depends on two switches, and the combination is recorded in
 | on | `0` | The controller pushes `n` frames as they are read | `autofetch` |
 | either | `1` | Starts a background loop and returns immediately; `abort` stops it | `freerun` or `freerun+autofetch` |
 
+In the `interleave` readout mode the count is passes, not frames. `expose <n>` runs `n` passes over
+the science window, each one a trigger that yields a frame per set, and with `freerun 1` passes
+repeat until `abort`. This runs on the polled pipeline only. See
+[commands](commands.md#interleaved-readout) for the settings and
+[configuration](configuration.md#interleaved-output) for what is published.
+
 `autofetch_mode` re-selects the `DEFAULT` pipeline whenever it changes, so the polled and autofetch
 pipelines never need selecting by hand.
 

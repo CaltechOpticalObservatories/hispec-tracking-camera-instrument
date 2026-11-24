@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <string>
 #include <thread>
@@ -84,6 +85,31 @@ namespace Camera {
     GuideOnly   //!< guide window per set and nothing else
   };
 
+  /** @brief  the name an output mode goes by in the .cfg and the FITS header */
+  const char* interleave_output_name(InterleaveOutput output);
+
+  /** @brief  where the guide window is, with a count that tells whether it is moving */
+  struct GuidePosition {
+    int vstart{0};
+    int vstop{0};
+    int hstart{0};
+    int hstop{0};
+    uint64_t changes{0};   //!< bumped when a move starts and again when it ends, so odd while one is under way
+  };
+
+  /** @brief  where a frame falls in an interleaved exposure, noted as it is fetched */
+  struct InterleaveTag {
+    int pass{0};                 //!< pass over the science window, from 0
+    int set{0};                  //!< set within that pass, from 0
+    GuidePosition guide;         //!< guide window in force when the frame was fetched
+    bool is_guide_moved{false};  //!< the window moved while the frame was being read
+  };
+
+  /** @brief  one fetched frame, tagged when it belongs to the interleave readout */
+  struct HispecFrame : public ArchonImageBuffer {
+    std::optional<InterleaveTag> interleave;
+  };
+
   // Shared base: owns the frame queue and the consumer; subclasses implement
   // only the producer (image_acquisition_thread).
   class ExposureModeHispecTrackingBase : public ExposureModeTemplate<Camera::ArchonInterface> {
@@ -143,10 +169,6 @@ namespace Camera {
       // out of range, and a throw leaving a thread terminates the process.
       std::atomic<int> nseq{1};
 
-      // Frames each unit of that trigger count yields. One, except for an
-      // interleaved pass, which is a single trigger and a frame per set.
-      std::atomic<int> frames_per_trigger{1};
-
       // Frames the producer actually queued, so a failure can report how far
       // the sequence got rather than only that it stopped
       std::atomic<long long> frames_acquired{0};
@@ -156,7 +178,7 @@ namespace Camera {
       std::atomic<long long> frames_dropped{0};
 
     protected:
-      void enqueue(std::shared_ptr<ArchonImageBuffer> buf);
+      void enqueue(std::shared_ptr<HispecFrame> buf);
 
       // Built once at the start of image_acquisition_thread(), read by the
       // consumer, so the values cannot shift mid-session.
@@ -173,7 +195,10 @@ namespace Camera {
       void process_frames(bool continuous);
 
       /** @brief  build the metadata for one frame and fan it out to frame_outputs */
-      void dispatch_one(const std::shared_ptr<ArchonImageBuffer> &buf, uint64_t sequence_number);
+      void dispatch_one(const std::shared_ptr<HispecFrame> &buf, uint64_t sequence_number);
+
+      /** @brief  metadata and per-frame FITS keys for one frame, as it was fetched */
+      FrameMetadata frame_metadata(const HispecFrame &frame, uint64_t sequence_number) const;
 
       /**
        * @brief  tell the session consumer to drain the queue and exit
@@ -227,7 +252,7 @@ namespace Camera {
        */
       long wait_for_frame(int &baseline, bool first_of_sequence);
 
-      std::queue<std::shared_ptr<ArchonImageBuffer>> imagebuf_queue;
+      std::queue<std::shared_ptr<HispecFrame>> imagebuf_queue;
 
       // Staging buffer for one FETCH, reused for the life of the object: the
       // Archon interleaves a 4-byte header every BLOCK_LEN bytes, so the wire

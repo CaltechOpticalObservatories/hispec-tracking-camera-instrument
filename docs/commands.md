@@ -87,18 +87,24 @@ In the `interleave` readout mode, `expose` first checks the three settings again
 refuses to start if:
 
 - the science height is not a whole multiple of `interleave_set`
-- the guide window is wider than the `<width>/2` columns each amplifier reads per line
+- the guide window is wider than the `<width>/2` columns each amplifier reads per line. A narrower
+  one is accepted with a warning in the log: it needs a sequencer that clocks every guide line out
+  to that width, and without one no frame completes and `expose` times out
 - no camera mode is selected, since the frame is laid out across its taplines
 
-It then sends them to the controller and sets the frame geometry. One Archon frame holds one set:
+It then clears any abort left set in the controller, sends the settings and sets the frame
+geometry. One Archon frame holds one set:
 `interleave_set` science lines followed by the guide window's lines, each `<width>/2` pixels per
 tap. With a 128 by 128 science window, `interleave_set 4` and a 10 by 10 guide window, a frame is
 192 by 14 and a pass over the science window is 32 frames.
 
-`expose <n>` runs `n` passes. Each pass is one trigger, and every frame of it is written as read,
-science lines and guide lines together. Between passes the sequencer is pointed back at the start
-of the science window. This is on the polled pipeline; freerun and autofetch do not yet loop over
-passes.
+`expose <n>` runs `n` passes, and with `freerun 1` passes repeat until `abort`. Each pass is one
+trigger. Before every one the sequencer is pointed back at the start of the science window, and an
+`abort` stops the passes that have not started. The sequencer finishes a pass one `exptime` delay
+after its last frame, so the next pass is not armed, and `expose` does not return, until that delay
+has run out. What is published from the frames of a pass is set
+by `INTERLEAVE_OUTPUT`, see [configuration](configuration.md#interleaved-output). This is on the
+polled pipeline; the autofetch pipeline does not yet run passes.
 
 The sets of a pass follow each other as fast as the detector reads them unless `exptime` is set,
 which adds that delay after every set. With no delay the polled pipeline cannot fetch each frame

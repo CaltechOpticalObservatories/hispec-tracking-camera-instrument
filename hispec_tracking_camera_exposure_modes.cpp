@@ -2,6 +2,7 @@
 #include "archon_exposure_modes.h"
 #include "common.h"
 #include "fits_header_dictionary.h"
+#include "fits_writer.h"
 #include "hispec_tracking_camera_exposure_modes.h"
 #include "hispec_tracking_camera_instrument.h"
 #include "timing_stats.h"
@@ -12,7 +13,9 @@
 #include <cmath>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <pthread.h>
 #include <sched.h>
 #include <sstream>
@@ -116,6 +119,11 @@ namespace Camera {
   // single bad frame is survivable; a persistent fault should not spin forever.
   static constexpr int MAX_CONSECUTIVE_ERRORS = 5;
 
+  // Allowed, on top of the exposure delay, for the sequencer to finish an
+  // interleaved pass once its last frame is complete. What is left by then
+  // takes it microseconds, so this is all margin.
+  static constexpr int PASS_SETTLE_MSEC = 20;
+
   // Used only when no geometry-derived deadline has been set
   static constexpr int DEFAULT_FRAME_WAIT_MSEC = 15000;
   static constexpr int FRAME_POLL_USEC = 1000;
@@ -127,6 +135,18 @@ namespace Camera {
   static size_t block_align(size_t n) {
     return ((n + BLOCK_LEN - 1) / BLOCK_LEN) * BLOCK_LEN;
   }
+
+
+  /***** Camera::interleave_output_name ***************************************/
+  const char* interleave_output_name(InterleaveOutput output) {
+    switch (output) {
+      case InterleaveOutput::Split:     return "split";
+      case InterleaveOutput::GuideOnly: return "guide";
+      case InterleaveOutput::Raw:       break;
+    }
+    return "raw";
+  }
+  /***** Camera::interleave_output_name ***************************************/
 
 
   /***** Camera::describe_placement *******************************************/
@@ -409,7 +429,7 @@ namespace Camera {
 
 
   /***** Camera::ExposureModeHispecTrackingBase::enqueue *********************/
-  void ExposureModeHispecTrackingBase::enqueue(std::shared_ptr<ArchonImageBuffer> buf) {
+  void ExposureModeHispecTrackingBase::enqueue(std::shared_ptr<HispecFrame> buf) {
     std::lock_guard<std::mutex> lock(this->queue_mutex);
     this->imagebuf_queue.push(std::move(buf));
     this->queue_cv.notify_one();
@@ -431,6 +451,19 @@ namespace Camera {
     set_dict_value(*keys, "subframe_mode", subframe_mode_for(hispec));
     set_dict_value(*keys, "read_mode", hispec->readout_mode());
     set_dict_value(*keys, "FREERUN", is_freerun ? "TRUE" : "FALSE");
+    if (hispec->is_interleave()) {
+      // Sizes only: the guide window's position goes with each frame, as it can move
+      const auto &interleave = hispec->interleave();
+      const GuidePosition guide = hispec->guide_position();
+      set_dict_value(*keys, "interleave_rows_per_set", std::to_string(interleave.rows_per_set));
+      set_dict_value(*keys, "interleave_sets_per_pass", std::to_string(interleave.sets_per_pass()));
+      set_dict_value(*keys, "interleave_science_start", std::to_string(interleave.science_start_row));
+      set_dict_value(*keys, "interleave_science_rows", std::to_string(interleave.science_rows));
+      set_dict_value(*keys, "interleave_science_pixels", std::to_string(interleave.science_pixels_per_tap));
+      set_dict_value(*keys, "interleave_guide_rows", std::to_string(guide.vstop - guide.vstart + 1));
+      set_dict_value(*keys, "interleave_guide_cols", std::to_string(guide.hstop - guide.hstart + 1));
+      set_dict_value(*keys, "interleave_output", interleave_output_name(hispec->interleave_output_mode()));
+    }
     set_dict_value(*keys, "file_type", "");
     set_dict_value(*keys, "bitpix", std::to_string(hispec->camera_info.bitpix));
     set_dict_value(*keys, "ref_channel_position", "");
@@ -648,20 +681,20 @@ namespace Camera {
     return ERROR;
   }
   /***** Camera::ExposureModeHispecTrackingBase::wait_for_frame **************/
-  /***** Camera::ExposureModeHispecTrackingBase::dispatch_one ****************/
+  /***** Camera::ExposureModeHispecTrackingBase::frame_metadata **************/
   /**
-   * @brief  Build the metadata for one frame and fan it out to frame_outputs
+   * @brief  Metadata and per-frame FITS keys for one frame, as it was fetched
    */
-  void ExposureModeHispecTrackingBase::dispatch_one(const std::shared_ptr<ArchonImageBuffer> &buf,
-                                                    uint64_t sequence_number) {
+  FrameMetadata ExposureModeHispecTrackingBase::frame_metadata(const HispecFrame &frame,
+                                                               uint64_t sequence_number) const {
     auto* hispec = static_cast<HispecTrackingCamera*>(this->interface);
 
     Camera::FrameMetadata meta;
-    meta.frame_number    = buf->bufframen_slice.empty()    ? 0 : static_cast<uint64_t>(buf->bufframen_slice[0]);
-    meta.timestamp       = buf->buftimestamp_slice.empty() ? 0 : buf->buftimestamp_slice[0];
-    meta.width           = buf->width;
-    meta.height          = buf->height;
-    meta.bytes_per_pixel = buf->bytes_per_pixel;
+    meta.frame_number    = frame.bufframen_slice.empty()    ? 0 : static_cast<uint64_t>(frame.bufframen_slice[0]);
+    meta.timestamp       = frame.buftimestamp_slice.empty() ? 0 : frame.buftimestamp_slice[0];
+    meta.width           = frame.width;
+    meta.height          = frame.height;
+    meta.bytes_per_pixel = frame.bytes_per_pixel;
     meta.sequence_number = sequence_number;
     meta.header_set      = this->header_set;
 
@@ -673,12 +706,174 @@ namespace Camera {
     set_dict_value(*frame_keys, "exposure_time",
                    precise(hispec->camera_info.exposure_time->get()));
     set_dict_value(*frame_keys, "n_reads", "1");
+    if (frame.interleave) {
+      const auto &tag = *frame.interleave;
+      const auto &interleave = hispec->interleave();
+      set_dict_value(*frame_keys, "interleave_pass", std::to_string(tag.pass));
+      set_dict_value(*frame_keys, "interleave_set_index", std::to_string(tag.set));
+      set_dict_value(*frame_keys, "interleave_set_row",
+                     std::to_string(interleave.science_start_row + tag.set * interleave.rows_per_set));
+      set_dict_value(*frame_keys, "guide_vstart", std::to_string(tag.guide.vstart));
+      set_dict_value(*frame_keys, "guide_vstop", std::to_string(tag.guide.vstop));
+      set_dict_value(*frame_keys, "guide_hstart", std::to_string(tag.guide.hstart));
+      set_dict_value(*frame_keys, "guide_hstop", std::to_string(tag.guide.hstop));
+      set_dict_value(*frame_keys, "guide_moved", tag.is_guide_moved ? "TRUE" : "FALSE");
+    }
     meta.frame_keys = std::move(frame_keys);
+    return meta;
+  }
+  /***** Camera::ExposureModeHispecTrackingBase::frame_metadata **************/
 
+
+  /***** Camera::ExposureModeHispecTrackingBase::dispatch_one ****************/
+  /**
+   * @brief  Build the metadata for one frame and fan it out to frame_outputs
+   */
+  void ExposureModeHispecTrackingBase::dispatch_one(const std::shared_ptr<HispecFrame> &buf,
+                                                    uint64_t sequence_number) {
+    const Camera::FrameMetadata meta = this->frame_metadata(*buf, sequence_number);
     const size_t frame_bytes = static_cast<size_t>(buf->width) * buf->height * buf->bytes_per_pixel;
     this->interface->dispatch_frame(buf->rawpixels.get(), frame_bytes, meta);
   }
   /***** Camera::ExposureModeHispecTrackingBase::dispatch_one ****************/
+
+
+  namespace {
+    // Stream the guide windows go out on: it names their SHM segment and FITS files
+    constexpr const char* GUIDE_STREAM = "guide";
+
+    // Header properties that describe one set, so not an image built from many
+    constexpr const char* SET_KEYS[] = {
+      "interleave_set_index", "interleave_set_row", "guide_vstart", "guide_vstop",
+      "guide_hstart", "guide_hstop", "guide_moved" };
+
+    // FRAMEMODE value with which the Archon stores a frame last line first, so
+    // the first row read ends up at the bottom. The ACF uses it for every mode.
+    constexpr int FRAMEMODE_BOTTOM_FIRST = 1;
+
+    bool is_stored_bottom_first(const HispecTrackingCamera &hispec) {
+      const auto &modes = hispec.controller->modemap;
+      const auto mode = modes.find(hispec.controller->selectedmode);
+      return mode != modes.end() && mode->second.geometry.framemode == FRAMEMODE_BOTTOM_FIRST;
+    }
+
+    /**
+     * @brief  Publishes interleaved frames as guide windows and a science image
+     * @details  Every frame carries one set: a few science lines and a whole
+     *           guide window. The guide window goes out at once on its own
+     *           stream. The science lines are gathered into one image, which
+     *           goes out on the primary stream when its pass is complete.
+     *
+     *           A set is read science lines first, and the Archon may store
+     *           the frame in that order or reversed. Both outputs keep the
+     *           stored order, so the science image comes out the way a frame of
+     *           the same rows read in one go would. Measured on the detector on
+     *           2026-11-23: bottom first, science in the last lines.
+     *
+     *           Owned by the consumer thread, so it needs no locking.
+     */
+    class InterleaveSplitter {
+      public:
+        explicit InterleaveSplitter(HispecTrackingCamera &hispec)
+          : camera(hispec),
+            science_lines(static_cast<uint32_t>(hispec.interleave().rows_per_set)),
+            science_rows(static_cast<uint32_t>(hispec.interleave().science_rows)),
+            is_bottom_first(is_stored_bottom_first(hispec)),
+            is_guide_only(hispec.interleave_output_mode() == InterleaveOutput::GuideOnly),
+            is_guide_in_fits(hispec.writes_guide_fits()) { }
+
+        void dispatch(const HispecFrame &frame, FrameMetadata meta);
+
+      private:
+        void write(const char* data, size_t bytes, const FrameMetadata &meta, bool to_fits);
+
+        HispecTrackingCamera &camera;
+
+        // Frozen while an exposure runs, so read once
+        const uint32_t science_lines;   //!< science lines in every frame
+        const uint32_t science_rows;    //!< rows of the assembled image
+        const bool is_bottom_first;     //!< frames are stored last line first
+        const bool is_guide_only;
+        const bool is_guide_in_fits;
+
+        std::vector<char> image;        //!< science image of the pass being gathered
+        int pass{-1};
+        int sets_gathered{0};           //!< sets copied into that image so far
+        uint64_t guide_count{0};
+        uint64_t image_count{0};
+        bool is_layout_reported{false};
+    };
+
+    void InterleaveSplitter::dispatch(const HispecFrame &frame, FrameMetadata meta) {
+      const size_t line_bytes = static_cast<size_t>(frame.width) * frame.bytes_per_pixel;
+      const uint32_t sets = this->science_rows / this->science_lines;
+
+      // A frame that is not laid out as expected goes out whole: better an
+      // unsplit frame than a wrong split
+      const int set = frame.interleave ? frame.interleave->set : -1;
+      if (frame.height <= this->science_lines || set < 0 || static_cast<uint32_t>(set) >= sets) {
+        if (!this->is_layout_reported) {
+          this->is_layout_reported = true;
+          logwrite("Camera::InterleaveSplitter::dispatch",
+                   "WARNING frame "+std::to_string(frame.width)+"x"+std::to_string(frame.height)+
+                   " (set "+std::to_string(set)+" of "+std::to_string(sets)+") does not hold "+
+                   std::to_string(this->science_lines)+" science lines and a guide window; "
+                   "such frames are published unsplit");
+        }
+        this->write(frame.rawpixels.get(), frame.height * line_bytes, meta, true);
+        return;
+      }
+
+      const uint32_t guide_lines = frame.height - this->science_lines;
+      const size_t science_bytes = this->science_lines * line_bytes;
+      const size_t guide_bytes   = guide_lines * line_bytes;
+      const char* science = frame.rawpixels.get() + (this->is_bottom_first ? guide_bytes : 0);
+      const char* guide   = frame.rawpixels.get() + (this->is_bottom_first ? 0 : science_bytes);
+
+      FrameMetadata guide_meta = meta;
+      guide_meta.stream          = GUIDE_STREAM;
+      guide_meta.height          = guide_lines;
+      guide_meta.sequence_number = this->guide_count++;
+      this->write(guide, guide_bytes, guide_meta, this->is_guide_in_fits);
+
+      if (this->is_guide_only) return;
+
+      // Started blank for every pass, so the rows of a set whose frame the
+      // controller overwrote read as zero, not as the previous pass
+      const size_t image_bytes = this->science_rows * line_bytes;
+      if (frame.interleave->pass != this->pass || this->image.size() != image_bytes) {
+        this->image.assign(image_bytes, 0);
+        this->pass = frame.interleave->pass;
+        this->sets_gathered = 0;
+      }
+      // Stored bottom first, the first set read belongs at the end of the image
+      const size_t image_set = this->is_bottom_first ? sets - 1 - set : set;
+      std::memcpy(this->image.data() + image_set * science_bytes, science, science_bytes);
+      ++this->sets_gathered;
+
+      if (static_cast<uint32_t>(set) == sets - 1) {
+        // The image is the whole pass, so it drops the keys that describe one
+        // set and says how much of the pass it holds
+        auto image_keys = std::make_shared<Common::FitsKeys>(*meta.frame_keys);
+        for (const char* property : SET_KEYS) {
+          if (const auto* entry = find_header_entry(property)) image_keys->keydb.erase(entry->keyword);
+        }
+        set_dict_value(*image_keys, "interleave_sets_gathered", std::to_string(this->sets_gathered));
+        meta.frame_keys      = std::move(image_keys);
+        meta.height          = this->science_rows;
+        meta.sequence_number = this->image_count++;
+        this->write(this->image.data(), image_bytes, meta, true);
+      }
+    }
+
+    void InterleaveSplitter::write(const char* data, size_t bytes, const FrameMetadata &meta,
+                                   bool to_fits) {
+      for (auto &output : this->camera.frame_outputs) {
+        if (!to_fits && dynamic_cast<const FitsWriter*>(output.get()) != nullptr) continue;
+        output->write(data, bytes, meta);
+      }
+    }
+  }
 
 
   /***** Camera::ExposureModeHispecTrackingBase::process_frames **************/
@@ -706,8 +901,15 @@ namespace Camera {
 
     uint64_t sequence_number = 0;
 
+    // Decided once: what a frame is published as cannot change under a running exposure
+    auto* hispec = static_cast<HispecTrackingCamera*>(this->interface);
+    std::optional<InterleaveSplitter> splitter;
+    if (hispec->is_interleave() && hispec->interleave_output_mode() != InterleaveOutput::Raw) {
+      splitter.emplace(*hispec);
+    }
+
     while (true) {
-      std::shared_ptr<ArchonImageBuffer> buf;
+      std::shared_ptr<HispecFrame> buf;
       {
         std::unique_lock<std::mutex> lock(this->queue_mutex);
         this->queue_cv.wait(lock, [this, &finished] {
@@ -730,7 +932,8 @@ namespace Camera {
         else continue;
       }
 
-      this->dispatch_one(buf, sequence_number++);
+      if (splitter) splitter->dispatch(*buf, this->frame_metadata(*buf, sequence_number++));
+      else          this->dispatch_one(buf, sequence_number++);
     }
 
     logwrite(function, "exit");
@@ -859,11 +1062,18 @@ namespace Camera {
 
     // Read once so this thread has one fixed behaviour for its whole life
     const bool freerun = this->is_freerun.load();
+    const bool interleaved = hispec->is_interleave();
 
     this->header_set = build_header_set(false, freerun);
 
+    // One trigger yields the whole sequence. The interleaved readout is the
+    // exception: there a trigger yields a single pass, a frame per set, so
+    // nseq counts passes and each one is triggered separately.
     const int nseq = this->nseq.load();
-    const long long frames_wanted = static_cast<long long>(nseq) * this->frames_per_trigger.load();
+    const int trigger_count = interleaved ? 1 : nseq;
+    const long long frames_per_trigger = interleaved ? hispec->interleave().sets_per_pass()
+                                                     : std::numeric_limits<long long>::max();
+    const long long frames_wanted = interleaved ? nseq * frames_per_trigger : nseq;
 
     auto* mode = &controller->modemap[controller->selectedmode];
     const int num_detect = mode->geometry.num_detect;
@@ -882,17 +1092,26 @@ namespace Camera {
       baseline = *std::max_element(bufframen.begin(), bufframen.end());
     }
 
-    long e = controller->prep_parameter(controller->expose_param, nseq);
-    if (e == NO_ERROR) e = controller->load_parameter(controller->expose_param, nseq);
-    if (e != NO_ERROR) {
-      hispec->log_error(function, "exposure trigger rejected",
-                 "the Archon refused FASTPREPPARAM/FASTLOADPARAM "+
-                 controller->expose_param+"="+std::to_string(nseq)+
-                 "; check that this parameter name matches the ACF exactly, it is "
-                 "case sensitive");
-      this->is_producer_error = true;
-      return;
-    }
+    // A pass leaves the sequencer at the end of the science window, so the
+    // interleaved readout is pointed back at its start before every trigger
+    const auto trigger = [&]() -> long {
+      if (interleaved && hispec->arm_interleave_pass() != NO_ERROR) {
+        hispec->log_error(function, "pass not armed",
+                   "the Archon refused H2RG_rows_skip or interleave_nsets; check that "
+                   "both exist in the loaded ACF");
+        return ERROR;
+      }
+      long e = controller->prep_parameter(controller->expose_param, trigger_count);
+      if (e == NO_ERROR) e = controller->load_parameter(controller->expose_param, trigger_count);
+      if (e != NO_ERROR) {
+        hispec->log_error(function, "exposure trigger rejected",
+                   "the Archon refused FASTPREPPARAM/FASTLOADPARAM "+
+                   controller->expose_param+"="+std::to_string(trigger_count)+
+                   "; check that this parameter name matches the ACF exactly, it is "
+                   "case sensitive");
+      }
+      return e;
+    };
 
     // 64-bit: in freerun these count for the life of the session, and signed
     // overflow is undefined behaviour, not a harmless wrap.
@@ -901,11 +1120,38 @@ namespace Camera {
     this->frames_acquired.store(0);
     this->frames_dropped.store(0);
     int consecutive_errors = 0;  //!< reset by every good frame; see MAX_CONSECUTIVE_ERRORS
+    long long frames_until_trigger = 0;  //!< of the last trigger's frames; at zero the next is due
+    int pass = -1;
+    uint64_t guide_changes = hispec->guide_position().changes;
+
+    // The sequencer finishes an interleaved pass later than its last frame
+    // does: that set's exposure delay still has to run, and only then does it
+    // count the set off. Parameters written before that are overwritten by its
+    // own bookkeeping, which leaves the next pass a set short.
+    std::chrono::steady_clock::time_point pass_settled;
+    const auto await_pass_settled = [&]() {
+      while (std::chrono::steady_clock::now() < pass_settled && !this->interface->is_aborted()) {
+        std::this_thread::sleep_for(std::chrono::microseconds(FRAME_POLL_USEC));
+      }
+    };
 
     for (long long i = 0; freerun || i < frames_wanted; ++i) {
+      if (interleaved && frames_until_trigger <= 0) await_pass_settled();
       if (this->interface->is_aborted()) break;
+
+      // Checked after the abort above, so a stopped exposure triggers nothing more
+      const bool triggering = (frames_until_trigger <= 0);
+      if (triggering) {
+        if (trigger() != NO_ERROR) {
+          this->is_producer_error = true;
+          return;
+        }
+        frames_until_trigger = frames_per_trigger;
+        ++pass;
+      }
+
       const long long dropped_before = this->frames_dropped.load();
-      if (this->wait_for_frame(baseline, i == 0) != NO_ERROR) {
+      if (this->wait_for_frame(baseline, triggering) != NO_ERROR) {
         // wait_for_frame reports an abort the same way it reports a timeout,
         // so without this a deliberate stop is returned to the caller as a
         // failed abort
@@ -914,7 +1160,18 @@ namespace Camera {
       }
       if (this->interface->is_aborted()) break;
       // Skipped frames still belong to the sequence, so it ends where the controller's does
-      i += this->frames_dropped.load() - dropped_before;
+      const long long skipped = this->frames_dropped.load() - dropped_before;
+      i += skipped;
+      // Counted with the skipped ones, so the set stays right across a gap
+      const int set = interleaved
+                    ? static_cast<int>(frames_per_trigger - frames_until_trigger + skipped) : 0;
+      frames_until_trigger -= skipped + 1;
+      if (interleaved && frames_until_trigger <= 0) {
+        const std::chrono::duration<double> exposure_delay(controller->get_exptime());
+        pass_settled = std::chrono::steady_clock::now() +
+                       std::chrono::duration_cast<std::chrono::steady_clock::duration>(exposure_delay) +
+                       std::chrono::milliseconds(PASS_SETTLE_MSEC);
+      }
 
       const auto idx = controller->frameinfo.index.load();
 
@@ -945,7 +1202,7 @@ namespace Camera {
       const unsigned bufblocks   = static_cast<unsigned>((frame_bytes + BLOCK_LEN - 1) / BLOCK_LEN);
       const size_t   nbytes      = static_cast<size_t>(bufblocks) * BLOCK_LEN;
 
-      auto imagebuffer = std::make_shared<ArchonImageBuffer>();
+      auto imagebuffer = std::make_shared<HispecFrame>();
       try { imagebuffer->rawpixels = std::shared_ptr<char[]>(new char[nbytes]); }
       catch (const std::exception &ex) {
         hispec->log_error(function, "out of memory",
@@ -973,12 +1230,23 @@ namespace Camera {
       imagebuffer->width           = fw;
       imagebuffer->height          = fh;
       imagebuffer->bytes_per_pixel = fbpp;
+      if (interleaved) {
+        // A change count that moved on, or is odd, means the window was being
+        // rewritten at some point while this frame was read out
+        const GuidePosition guide = hispec->guide_position();
+        const bool moved = (guide.changes != guide_changes) || (guide.changes % 2 != 0);
+        guide_changes = guide.changes;
+        imagebuffer->interleave = InterleaveTag{pass, set, guide, moved};
+      }
       imagebuffer->bufframen_slice.push_back(controller->frameinfo.bufframen[idx]);
       imagebuffer->buftimestamp_slice.push_back(controller->frameinfo.buftimestamp[idx]);
       this->enqueue(std::move(imagebuffer));
       ++frames_read;
       this->frames_acquired.store(frames_read);
     }
+
+    // So the command returns with the sequencer idle, ready for the next one
+    if (interleaved) await_pass_settled();
 
     logwrite(function, freerun
              ? "freerun acquisition stopped after " + std::to_string(frames_read) +
@@ -1085,7 +1353,7 @@ namespace Camera {
       const uint32_t fbpp = 2;
       const size_t   nbytes = static_cast<size_t>(fw) * fh * fbpp;
 
-      auto imagebuffer = std::make_shared<ArchonImageBuffer>();
+      auto imagebuffer = std::make_shared<HispecFrame>();
       try { imagebuffer->rawpixels = std::shared_ptr<char[]>(new char[nbytes]); }
       catch (const std::exception &ex) {
         logwrite(function, "ERROR allocating image buffer: " + std::string(ex.what()));

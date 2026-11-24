@@ -67,6 +67,13 @@ namespace Camera {
       bool writes_guide_fits() const { return is_guide_fits_enabled; }
 
       /**
+       * @brief      where the guide window is now, and whether it is moving
+       * @details    For the acquisition threads, which tag every frame with it.
+       *             Never waits on a move in progress.
+       */
+      GuidePosition guide_position() const;
+
+      /**
        * @brief      point the sequencer at the start of the science window
        * @details    A pass leaves H2RG_rows_skip at the window's last row and
        *             interleave_nsets at zero, so both are rewritten before
@@ -157,6 +164,10 @@ namespace Camera {
       // Guards interleave_geometry, and is held across the register writes of a
       // guide window move so that two moves cannot mix on the wire
       std::mutex interleave_mutex;
+      // Held only to copy the guide window's bounds, so a reader never waits on
+      // the register writes that interleave_mutex is held across
+      mutable std::mutex guide_position_mutex;
+      std::atomic<uint64_t> guide_changes{0};   //!< see GuidePosition::changes
       std::atomic<int> exposes_in_progress{0};   //!< expose() calls that have not yet returned
       InterleaveOutput interleave_output{InterleaveOutput::Raw};
       bool is_guide_fits_enabled{false};
