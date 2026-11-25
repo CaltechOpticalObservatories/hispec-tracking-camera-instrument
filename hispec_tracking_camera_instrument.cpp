@@ -68,6 +68,10 @@ namespace Camera {
 
     constexpr std::string_view INTERLEAVE_READOUT = "interleave";
 
+    // Reads every pixel twice, so its CDS line is twice the detector's
+    constexpr std::string_view RXR_READOUT = "rxr";
+    constexpr int RXR_SAMPLES_PER_PIXEL = 2;
+
     constexpr int H2RG_BITS_PER_PIXEL = 16;
 
     std::optional<double> positive_ticks(const std::string &text) {
@@ -568,14 +572,7 @@ namespace Camera {
 
       //Clear abort state before starting freerun loop
       this->clear_abortstate();
-      std::string dummy;
-      if (this->set_parameter("abort 0", dummy) != NO_ERROR) {
-        this->is_freerun_active.store(false);  // release the guard
-        return this->fail_detailed(function, retstring, "cannot clear abort",
-                   "the Archon rejected \"abort 0\"; ABORT_PARAM in the .cfg must "
-                   "match the ACF parameter name exactly, it is case sensitive");
-      }
-      if (this->is_interleave() && this->apply_interleave(retstring) != NO_ERROR) {
+      if (this->prepare_trigger(retstring) != NO_ERROR) {
         this->is_freerun_active.store(false);  // release the guard
         return ERROR;
       }
@@ -622,7 +619,7 @@ namespace Camera {
         return this->fail_detailed(function, retstring, "exposure mode not set",
                    "no acquisition pipeline is selected");
       }
-      if (this->is_interleave() && this->apply_interleave(retstring) != NO_ERROR) return ERROR;
+      if (this->prepare_trigger(retstring) != NO_ERROR) return ERROR;
       if (auto* m = dynamic_cast<ExposureModeHispecTrackingBase*>(this->exposuremode.get())) {
         m->set_args({args});
         // do_expose() joins the producer, so it must not be the endless one
@@ -783,8 +780,8 @@ namespace Camera {
     // this an exposure following an abort would quietly return no frames
     this->clear_abortstate();
 
-    // Ahead of the deadline below, which is worked out from the geometry this sets
-    if (this->is_interleave() && this->apply_interleave(retstring) != NO_ERROR) return ERROR;
+    // Ahead of the deadline below, which is worked out from the geometry the interleaved readout sets
+    if (this->prepare_trigger(retstring) != NO_ERROR) return ERROR;
 
     // Recomputed per command because roi and mode change the geometry
     const int timeout_msec = this->readout_timeout_msec();
@@ -1214,10 +1211,18 @@ namespace Camera {
       if (this->restore_pre_interleave_readout(retstring) != NO_ERROR) return ERROR;
     }
 
-    // iterate through the arguments and set param to 0
+    // Every readout's parameter goes to 0, then the chosen one to 1. An ACF that
+    // predates a readout lacks its parameter, which then needs no clearing; any
+    // other refusal is reported rather than lost behind a later write.
+    const auto &acf_parameters = this->controller->parammap;
     for (const auto &[key, value] : _exposure_modes) {
+      if (value != mode_value && !acf_parameters.empty() && acf_parameters.find(value) == acf_parameters.end()) {
+        logwrite(function, "WARNING "+value+" is not in the loaded ACF, so readout \""+key+
+                           "\" is unavailable; not clearing it");
+        continue;
+      }
       param_cmd = value + " 0";
-      error = this->set_parameter(param_cmd, dummy);
+      if (this->set_parameter(param_cmd, dummy) != NO_ERROR) error = ERROR;
     }
 
     // set current exposure mode
@@ -1225,17 +1230,10 @@ namespace Camera {
     if (error == NO_ERROR) error = this->set_parameter(param_cmd, dummy);
 
     // update the exposure mode in the camera
+    const bool was_rxr = (this->cur_exposure_mode == RXR_READOUT);
     this->cur_exposure_mode = mode_name;
 
-    // update cds if needed
-    if (this->cur_exposure_mode == "rxr") {
-      bool changed = false;
-      auto &mode = this->controller->modemap[this->controller->selectedmode];
-      int pixelcount = mode.geometry.pixelcount * 2;
-      if (error == NO_ERROR) error = this->controller->write_config_key("PIXELCOUNT", pixelcount, changed);
-      if (changed) this->controller->send_cmd(APPLYCDS);
-      mode.geometry.pixelcount = pixelcount;
-    }
+    if (error == NO_ERROR) error = this->match_pixelcount_to_readout(was_rxr);
     //return retstring and error
     retstring = mode_name;
     return error;
@@ -1597,9 +1595,12 @@ namespace Camera {
                          "height="+tokens[0]+" width="+tokens[1]+
                          "; limits are height<=2048 and width<=1024");
           }
-      } catch (std::invalid_argument &) {
+      } catch (const std::invalid_argument &) {
           return this->fail_detailed(function, retstring, "ROI not numeric",
                      "could not parse \""+args+"\" as <height> <width>");
+      } catch (const std::out_of_range &) {
+          return this->fail_detailed(function, retstring, "ROI exceeds the detector",
+                     "\""+args+"\" is too large to be a pixel count");
       }
     } else {
       // Check if the four arguments are valid vstart, vstop, hstart, hstop
@@ -1608,9 +1609,12 @@ namespace Camera {
           vstop = std::stoi(tokens[1]);
           hstart = std::stoi(tokens[2]);
           hstop = std::stoi(tokens[3]);
-      } catch (std::invalid_argument &) {
+      } catch (const std::invalid_argument &) {
           return this->fail_detailed(function, retstring, "ROI not numeric",
                      "could not parse \""+args+"\" as four integers");
+      } catch (const std::out_of_range &) {
+          return this->fail_detailed(function, retstring, "ROI outside the detector",
+                     "\""+args+"\" is too large to be a pixel index");
       }
       // Validate values are within detector
       if ( vstart < 0 || vstop > 2047 || hstart < 0 || hstop > 2047) {
@@ -2145,14 +2149,7 @@ namespace Camera {
     const int pixelcount = geometry.science_pixels_per_tap;
     const int linecount  = geometry.lines_per_frame();
 
-    // An abort sent while the sequencer was idle stays set in the controller,
-    // and would end this exposure after its first set
-    if (!this->controller->abort_param.empty() &&
-        this->set_parameter_offstream(this->controller->abort_param, 0) != NO_ERROR) {
-      return this->fail_detailed(function, retstring, "interleave not applied",
-                 "the controller rejected "+this->controller->abort_param+"=0; ABORT_PARAM "
-                 "in the .cfg must match the ACF parameter name exactly");
-    }
+    if (this->clear_controller_abort(retstring) != NO_ERROR) return ERROR;
 
     if (this->set_parameter_offstream("H2RG_columns", pixelcount)               != NO_ERROR ||
         this->set_parameter_offstream("interleave_set", geometry.rows_per_set)  != NO_ERROR ||
@@ -2201,6 +2198,78 @@ namespace Camera {
     return NO_ERROR;
   }
   /***** Camera::HispecTrackingCamera::apply_interleave **********************/
+
+
+  /***** Camera::HispecTrackingCamera::match_pixelcount_to_readout ***********/
+  /**
+   * @brief      set PIXELCOUNT for a switch into or out of the rxr readout
+   * @details    Derived from H2RG_columns as last written rather than from
+   *             PIXELCOUNT, so a geometry set while in rxr by a command that
+   *             does not double it is not halved on the way out, and entering
+   *             rxr twice does not double it twice. In window mode, where
+   *             H2RG_columns does not apply, the current width is scaled.
+   * @param[in]  was_rxr  whether the readout being left was rxr
+   * @return     ERROR|NO_ERROR
+   *
+   */
+  long HispecTrackingCamera::match_pixelcount_to_readout(bool was_rxr) {
+    const bool is_rxr = (this->cur_exposure_mode == RXR_READOUT);
+    if (is_rxr == was_rxr) return NO_ERROR;
+
+    auto &mode = this->controller->modemap[this->controller->selectedmode];
+    std::optional<int> columns;
+    if (!this->is_window) {
+      const std::lock_guard<std::mutex> lock(this->interleave_mutex);
+      if (this->h2rg_window) columns = this->h2rg_window->columns;
+    }
+    const int current = mode.geometry.pixelcount;
+    const int detector_columns = columns.value_or(was_rxr ? current / RXR_SAMPLES_PER_PIXEL : current);
+    const int pixelcount = is_rxr ? detector_columns * RXR_SAMPLES_PER_PIXEL : detector_columns;
+
+    bool changed = false;
+    long error = this->controller->write_config_key("PIXELCOUNT", pixelcount, changed);
+    if (error == NO_ERROR && changed) error = this->controller->send_cmd(APPLYCDS);
+    if (error == NO_ERROR) mode.geometry.pixelcount = pixelcount;
+    return error;
+  }
+  /***** Camera::HispecTrackingCamera::match_pixelcount_to_readout ***********/
+
+
+  /***** Camera::HispecTrackingCamera::clear_controller_abort *****************/
+  /**
+   * @brief      clear the controller's abort parameter ahead of a trigger
+   * @details    Nothing in the sequencer consumes an abort sent while it is
+   *             idle, so it stays set and cuts the next exposure short.
+   * @param[out] retstring  reason on failure
+   * @return     ERROR|NO_ERROR
+   *
+   */
+  long HispecTrackingCamera::clear_controller_abort(std::string &retstring) {
+    const std::string function("Camera::HispecTrackingCamera::clear_controller_abort");
+    const std::string &abort_param = this->controller->abort_param;
+    if (abort_param.empty()) return NO_ERROR;
+    if (this->set_parameter_offstream(abort_param, 0) != NO_ERROR) {
+      return this->fail_detailed(function, retstring, "cannot clear abort",
+                 "the controller rejected "+abort_param+"=0; ABORT_PARAM in the .cfg must "
+                 "match the ACF parameter name exactly, it is case sensitive");
+    }
+    return NO_ERROR;
+  }
+  /***** Camera::HispecTrackingCamera::clear_controller_abort *****************/
+
+
+  /***** Camera::HispecTrackingCamera::prepare_trigger ************************/
+  /**
+   * @brief      the controller writes every exposure path makes before its trigger
+   * @details    apply_interleave() clears the abort itself, after checking its
+   *             settings, so that a refused exposure writes nothing.
+   *
+   */
+  long HispecTrackingCamera::prepare_trigger(std::string &retstring) {
+    return this->is_interleave() ? this->apply_interleave(retstring)
+                                 : this->clear_controller_abort(retstring);
+  }
+  /***** Camera::HispecTrackingCamera::prepare_trigger ************************/
 
   /***** Camera::HispecTrackingCamera::arm_interleave_pass ********************/
   /**

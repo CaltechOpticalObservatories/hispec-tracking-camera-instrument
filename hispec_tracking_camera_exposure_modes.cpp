@@ -119,8 +119,8 @@ namespace Camera {
   // single bad frame is survivable; a persistent fault should not spin forever.
   static constexpr int MAX_CONSECUTIVE_ERRORS = 5;
 
-  // Allowed, on top of the exposure delay, for the sequencer to finish an
-  // interleaved pass once its last frame is complete. What is left by then
+  // Allowed, on top of the exposure delay, for the sequencer to finish a
+  // sequence, or an interleaved pass, once its last frame is complete. What is left by then
   // takes it microseconds, so this is all margin.
   static constexpr int PASS_SETTLE_MSEC = 20;
 
@@ -1079,6 +1079,18 @@ namespace Camera {
     const int num_detect = mode->geometry.num_detect;
     const int fallback_bpp = (mode->samplemode == 1) ? 4 : 2;
 
+    // A trigger written while the sequencer still runs the previous sequence's
+    // last exposure delay is overwritten by its own count down, and nothing is
+    // read. Waited out here, ahead of the baseline below: the idle frames read
+    // meanwhile must not count as this sequence's.
+    if (const auto wait = this->sequencer_settled - std::chrono::steady_clock::now(); wait.count() > 0) {
+      logwrite(function, "waiting "+std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(wait).count())+
+                         " msec for the previous sequence's exposure delay");
+    }
+    while (std::chrono::steady_clock::now() < this->sequencer_settled && !this->interface->is_aborted()) {
+      std::this_thread::sleep_for(std::chrono::microseconds(FRAME_POLL_USEC));
+    }
+
     // Newest frame the controller has, taken before the trigger. Taken after it,
     // a frame the sequencer has already begun looks like one that predates the
     // request, and the sequence comes up a frame short. The ACF idles by reading
@@ -1129,6 +1141,7 @@ namespace Camera {
     // count the set off. Parameters written before that are overwritten by its
     // own bookkeeping, which leaves the next pass a set short.
     std::chrono::steady_clock::time_point pass_settled;
+    std::chrono::steady_clock::time_point last_frame_at;
     const auto await_pass_settled = [&]() {
       while (std::chrono::steady_clock::now() < pass_settled && !this->interface->is_aborted()) {
         std::this_thread::sleep_for(std::chrono::microseconds(FRAME_POLL_USEC));
@@ -1243,10 +1256,21 @@ namespace Camera {
       this->enqueue(std::move(imagebuffer));
       ++frames_read;
       this->frames_acquired.store(frames_read);
+      last_frame_at = std::chrono::steady_clock::now();
     }
 
-    // So the command returns with the sequencer idle, ready for the next one
-    if (interleaved) await_pass_settled();
+    // So the command returns with the sequencer idle, ready for the next one.
+    // Other readouts return at once and leave the wait to the next sequence,
+    // since nothing is written between the two that the sequencer could undo.
+    if (interleaved) {
+      await_pass_settled();
+    }
+    else if (!freerun && frames_read > 0 && !this->interface->is_aborted()) {
+      const std::chrono::duration<double> exposure_delay(controller->get_exptime());
+      this->sequencer_settled = last_frame_at +
+                                std::chrono::duration_cast<std::chrono::steady_clock::duration>(exposure_delay) +
+                                std::chrono::milliseconds(PASS_SETTLE_MSEC);
+    }
 
     logwrite(function, freerun
              ? "freerun acquisition stopped after " + std::to_string(frames_read) +

@@ -126,6 +126,9 @@ namespace Camera {
 
       // Send what the interleave commands recorded to the controller, ahead of a trigger
       long apply_interleave(std::string &retstring);
+      long clear_controller_abort(std::string &retstring);
+      long prepare_trigger(std::string &retstring);
+      long match_pixelcount_to_readout(bool was_rxr);
 
       // The geometry an interleaved exposure started with has to hold until it ends
       bool is_interleave_frozen() const {

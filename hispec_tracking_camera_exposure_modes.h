@@ -4,6 +4,7 @@
 #include "archon_exposure_modes.h" // ArchonImageBuffer
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -172,6 +173,11 @@ namespace Camera {
       // Frames the producer actually queued, so a failure can report how far
       // the sequence got rather than only that it stopped
       std::atomic<long long> frames_acquired{0};
+
+      // When the sequencer will have run the last sequence's final exposure delay.
+      // Written by one producer and read by the next, which starts only after the
+      // first is joined, so it needs no atomic.
+      std::chrono::steady_clock::time_point sequencer_settled{};
 
       // Frames the controller overwrote before the host fetched them, which the
       // producer skips past rather than stopping

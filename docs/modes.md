@@ -22,7 +22,8 @@ Readout mode (`exposure`)
     | `rxr` | `mode_RXR` | Reset-execute-read |
     | `interleave` | `mode_InterleavedGuiding` | Science rows alternating with a guide window, see [commands](commands.md#interleaved-readout) |
 
-  Selecting `rxr` doubles `PIXELCOUNT`.
+  `rxr` reads every pixel twice, so selecting it sets `PIXELCOUNT` to twice `H2RG_columns`, and
+  selecting another readout sets it back.
 
 Exposure mode (`exposuremode`)
 : The base command, selecting which acquisition pipeline drives an exposure. This module adds
@@ -56,6 +57,11 @@ controller's control connection instead, so their replies are not lost behind fr
 
 `abort` during freerun returns once both threads have joined, so freerun can be restarted straight
 away.
+
+Every `expose` first clears the controller's `ABORT_PARAM`: the sequencer never consumes an `abort`
+sent while it is idle, and it would otherwise cut the next exposure short. A sequence is not
+triggered until the previous one's last `exptime` delay has run out, since the sequencer ignores a
+trigger written during it.
 
 If the host falls behind and the controller overwrites frames before they are fetched, acquisition
 logs a warning, counts them, and continues from the newest frame; the count is in the line logged
