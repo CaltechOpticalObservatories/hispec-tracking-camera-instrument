@@ -13,7 +13,6 @@
 #include <cmath>
 #include <cstring>
 #include <iomanip>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <pthread.h>
@@ -124,6 +123,16 @@ namespace Camera {
   // takes it microseconds, so this is all margin.
   static constexpr int PASS_SETTLE_MSEC = 20;
 
+  // The sequencer runs one more exposure delay after a sequence's, or a pass's,
+  // last frame before it counts it off; a parameter written meanwhile is
+  // overwritten by that bookkeeping, which leaves the next pass a set short
+  static std::chrono::steady_clock::time_point sequencer_idle_after(
+      std::chrono::steady_clock::time_point last_frame, double exptime_sec) {
+    return last_frame + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                            std::chrono::duration<double>(exptime_sec)) +
+           std::chrono::milliseconds(PASS_SETTLE_MSEC);
+  }
+
   // Used only when no geometry-derived deadline has been set
   static constexpr int DEFAULT_FRAME_WAIT_MSEC = 15000;
   static constexpr int FRAME_POLL_USEC = 1000;
@@ -137,16 +146,23 @@ namespace Camera {
   }
 
 
+  static constexpr std::pair<InterleaveOutput, const char*> INTERLEAVE_OUTPUT_NAMES[] = {
+    {InterleaveOutput::Raw, "raw"}, {InterleaveOutput::Split, "split"}, {InterleaveOutput::GuideOnly, "guide"}};
+
   /***** Camera::interleave_output_name ***************************************/
   const char* interleave_output_name(InterleaveOutput output) {
-    switch (output) {
-      case InterleaveOutput::Split:     return "split";
-      case InterleaveOutput::GuideOnly: return "guide";
-      case InterleaveOutput::Raw:       break;
-    }
+    for (const auto &[value, name] : INTERLEAVE_OUTPUT_NAMES) if (value == output) return name;
     return "raw";
   }
   /***** Camera::interleave_output_name ***************************************/
+
+
+  /***** Camera::parse_interleave_output **************************************/
+  InterleaveOutput parse_interleave_output(const std::string &text) {
+    for (const auto &[value, name] : INTERLEAVE_OUTPUT_NAMES) if (text == name) return value;
+    throw std::runtime_error("INTERLEAVE_OUTPUT="+text+": expected raw, split or guide");
+  }
+  /***** Camera::parse_interleave_output **************************************/
 
 
   /***** Camera::describe_placement *******************************************/
@@ -1071,13 +1087,18 @@ namespace Camera {
     // nseq counts passes and each one is triggered separately.
     const int nseq = this->nseq.load();
     const int trigger_count = interleaved ? 1 : nseq;
-    const long long frames_per_trigger = interleaved ? hispec->interleave().sets_per_pass()
-                                                     : std::numeric_limits<long long>::max();
-    const long long frames_wanted = interleaved ? nseq * frames_per_trigger : nseq;
+    const int sets_per_pass = hispec->interleave().sets_per_pass();
+    const long long frames_wanted = hispec->frames_for(nseq);
 
     auto* mode = &controller->modemap[controller->selectedmode];
     const int num_detect = mode->geometry.num_detect;
     const int fallback_bpp = (mode->samplemode == 1) ? 4 : 2;
+
+    const auto await_sequencer_idle = [this]() {
+      while (std::chrono::steady_clock::now() < this->sequencer_settled && !this->interface->is_aborted()) {
+        std::this_thread::sleep_for(std::chrono::microseconds(FRAME_POLL_USEC));
+      }
+    };
 
     // A trigger written while the sequencer still runs the previous sequence's
     // last exposure delay is overwritten by its own count down, and nothing is
@@ -1087,9 +1108,7 @@ namespace Camera {
       logwrite(function, "waiting "+std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(wait).count())+
                          " msec for the previous sequence's exposure delay");
     }
-    while (std::chrono::steady_clock::now() < this->sequencer_settled && !this->interface->is_aborted()) {
-      std::this_thread::sleep_for(std::chrono::microseconds(FRAME_POLL_USEC));
-    }
+    await_sequencer_idle();
 
     // Newest frame the controller has, taken before the trigger. Taken after it,
     // a frame the sequencer has already begun looks like one that predates the
@@ -1132,34 +1151,24 @@ namespace Camera {
     this->frames_acquired.store(0);
     this->frames_dropped.store(0);
     int consecutive_errors = 0;  //!< reset by every good frame; see MAX_CONSECUTIVE_ERRORS
-    long long frames_until_trigger = 0;  //!< of the last trigger's frames; at zero the next is due
     int pass = -1;
+    int next_set = 0;  //!< interleaved: the set the next frame belongs to
     uint64_t guide_changes = hispec->guide_position().changes;
-
-    // The sequencer finishes an interleaved pass later than its last frame
-    // does: that set's exposure delay still has to run, and only then does it
-    // count the set off. Parameters written before that are overwritten by its
-    // own bookkeeping, which leaves the next pass a set short.
-    std::chrono::steady_clock::time_point pass_settled;
     std::chrono::steady_clock::time_point last_frame_at;
-    const auto await_pass_settled = [&]() {
-      while (std::chrono::steady_clock::now() < pass_settled && !this->interface->is_aborted()) {
-        std::this_thread::sleep_for(std::chrono::microseconds(FRAME_POLL_USEC));
-      }
-    };
 
     for (long long i = 0; freerun || i < frames_wanted; ++i) {
-      if (interleaved && frames_until_trigger <= 0) await_pass_settled();
+      // An interleaved pass is re-armed only once the sequencer has finished the last
+      const bool triggering = (i == 0) || (interleaved && next_set >= sets_per_pass);
+      if (triggering && interleaved) await_sequencer_idle();
+      // Checked before the trigger, so a stopped exposure triggers nothing more
       if (this->interface->is_aborted()) break;
 
-      // Checked after the abort above, so a stopped exposure triggers nothing more
-      const bool triggering = (frames_until_trigger <= 0);
       if (triggering) {
         if (trigger() != NO_ERROR) {
           this->is_producer_error = true;
           return;
         }
-        frames_until_trigger = frames_per_trigger;
+        next_set = 0;
         ++pass;
       }
 
@@ -1175,15 +1184,14 @@ namespace Camera {
       // Skipped frames still belong to the sequence, so it ends where the controller's does
       const long long skipped = this->frames_dropped.load() - dropped_before;
       i += skipped;
-      // Counted with the skipped ones, so the set stays right across a gap
-      const int set = interleaved
-                    ? static_cast<int>(frames_per_trigger - frames_until_trigger + skipped) : 0;
-      frames_until_trigger -= skipped + 1;
-      if (interleaved && frames_until_trigger <= 0) {
-        const std::chrono::duration<double> exposure_delay(controller->get_exptime());
-        pass_settled = std::chrono::steady_clock::now() +
-                       std::chrono::duration_cast<std::chrono::steady_clock::duration>(exposure_delay) +
-                       std::chrono::milliseconds(PASS_SETTLE_MSEC);
+      int set = 0;
+      if (interleaved) {
+        // Counted with the skipped ones, so the set stays right across a gap
+        set = next_set + static_cast<int>(skipped);
+        next_set = set + 1;
+        if (next_set >= sets_per_pass) {
+          this->sequencer_settled = sequencer_idle_after(std::chrono::steady_clock::now(), controller->get_exptime());
+        }
       }
 
       const auto idx = controller->frameinfo.index.load();
@@ -1263,13 +1271,10 @@ namespace Camera {
     // Other readouts return at once and leave the wait to the next sequence,
     // since nothing is written between the two that the sequencer could undo.
     if (interleaved) {
-      await_pass_settled();
+      await_sequencer_idle();
     }
     else if (!freerun && frames_read > 0 && !this->interface->is_aborted()) {
-      const std::chrono::duration<double> exposure_delay(controller->get_exptime());
-      this->sequencer_settled = last_frame_at +
-                                std::chrono::duration_cast<std::chrono::steady_clock::duration>(exposure_delay) +
-                                std::chrono::milliseconds(PASS_SETTLE_MSEC);
+      this->sequencer_settled = sequencer_idle_after(last_frame_at, controller->get_exptime());
     }
 
     logwrite(function, freerun

@@ -89,6 +89,13 @@ namespace Camera {
   /** @brief  the name an output mode goes by in the .cfg and the FITS header */
   const char* interleave_output_name(InterleaveOutput output);
 
+  /**
+   * @brief   the output mode a .cfg name stands for
+   * @throws  std::runtime_error for any other name: a misspelt value fails
+   *          startup rather than publish something the .cfg did not ask for
+   */
+  InterleaveOutput parse_interleave_output(const std::string &text);
+
   /** @brief  where the guide window is, with a count that tells whether it is moving */
   struct GuidePosition {
     int vstart{0};
@@ -174,9 +181,9 @@ namespace Camera {
       // the sequence got rather than only that it stopped
       std::atomic<long long> frames_acquired{0};
 
-      // When the sequencer will have run the last sequence's final exposure delay.
-      // Written by one producer and read by the next, which starts only after the
-      // first is joined, so it needs no atomic.
+      // When the sequencer will have run the exposure delay after the last frame of
+      // a sequence or an interleaved pass. Only producers use it, and one starts
+      // only after the last is joined, so it needs no atomic.
       std::chrono::steady_clock::time_point sequencer_settled{};
 
       // Frames the controller overwrote before the host fetched them, which the

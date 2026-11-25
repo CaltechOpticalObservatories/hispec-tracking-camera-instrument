@@ -64,16 +64,17 @@ namespace Camera {
       const std::string& reference_amp() const { return refpix_amp; }
       const std::string& readout_mode() const { return cur_exposure_mode; }
 
-      bool is_interleave() const { return cur_exposure_mode == "interleave"; }
+      bool is_interleave() const { return cur_exposure_mode == INTERLEAVE_READOUT; }
       const InterleaveGeometry& interleave() const { return interleave_geometry; }
       InterleaveOutput interleave_output_mode() const { return interleave_output; }
       bool writes_guide_fits() const { return is_guide_fits_enabled; }
 
-      /**
-       * @brief      where the guide window is now, and whether it is moving
-       * @details    For the acquisition threads, which tag every frame with it.
-       *             Never waits on a move in progress.
-       */
+      // An interleaved expose counts passes, each a frame per set
+      long long frames_for(int nseq) const {
+        return is_interleave() ? static_cast<long long>(nseq) * interleave_geometry.sets_per_pass() : nseq;
+      }
+
+      /** @brief  where the guide window is, for tagging frames; never waits on a move */
       GuidePosition guide_position() const;
 
       /**
@@ -81,7 +82,6 @@ namespace Camera {
        * @details    A pass leaves H2RG_rows_skip at the window's last row and
        *             interleave_nsets at zero, so both are rewritten before
        *             every trigger.
-       * @return     ERROR|NO_ERROR
        */
       long arm_interleave_pass();
 
@@ -99,6 +99,7 @@ namespace Camera {
     private:
       // The reference channel's tapline moves with the mode, its amp does not
       static constexpr const char* DEFAULT_REFPIX_AMP = "AM52";
+      static constexpr const char* INTERLEAVE_READOUT = "interleave";
 
       using CmdHandler = long (HispecTrackingCamera::*)(const std::string&, std::string&);
       static const std::unordered_map<std::string, CmdHandler> command_handlers_;
@@ -123,6 +124,9 @@ namespace Camera {
       long interleave_guide(const std::string &args, std::string &retstring);
       long interleave_set(const std::string &args, std::string &retstring);
       long write_guide_window(int vstart, int vstop, int hstart, int hstop);
+      std::optional<std::vector<int>> parse_window(const std::string &function, const std::string &args,
+                                                   size_t count, const std::string &usage,
+                                                   std::string &retstring);
 
       // Send what the interleave commands recorded to the controller, ahead of a trigger
       long apply_interleave(std::string &retstring);
@@ -130,18 +134,21 @@ namespace Camera {
       long prepare_trigger(std::string &retstring);
       long match_pixelcount_to_readout(bool was_rxr);
 
+      // PIXELCOUNT and LINECOUNT, with one APPLYCDS if either changed; no linecount leaves it alone
+      long write_cds_geometry(int pixelcount, std::optional<int> linecount = std::nullopt);
+
       // The geometry an interleaved exposure started with has to hold until it ends
       bool is_interleave_frozen() const {
         return is_interleave() && (exposes_in_progress.load() > 0 || is_freerun_active.load());
       }
 
-      /** H2RG_columns and H2RG_rows_skip, which the detector reads and the host cannot read back */
+      // H2RG_columns and H2RG_rows_skip, which the host cannot read back
       struct H2rgWindow {
         int columns{0};
         int rows_skip{0};
       };
 
-      /** What apply_interleave() overwrites, kept so that leaving the readout can put it back */
+      // What apply_interleave() overwrites, kept so that leaving the readout can put it back
       struct SavedReadout {
         std::string camera_mode;
         int pixelcount{0};
@@ -153,6 +160,7 @@ namespace Camera {
 
       void record_h2rg_window(int columns, int rows_skip);
       void discard_pre_interleave_readout();
+      void put_back_mode_geometry(const SavedReadout &saved);
       std::optional<H2rgWindow> current_h2rg_window() const;
       long restore_pre_interleave_readout(std::string &retstring);
 

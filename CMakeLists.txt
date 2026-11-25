@@ -34,6 +34,7 @@ FetchContent_MakeAvailable(camera_interface)
 
 set(TRACKING_SOURCES
   hispec_tracking_camera_instrument.cpp
+  hispec_tracking_camera_interleave.cpp
   hispec_tracking_camera_interface_factory.cpp
   hispec_tracking_camera_exposure_modes.cpp
   fits_header_dictionary.cpp
